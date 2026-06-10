@@ -7,19 +7,22 @@ Just open `index.html` in a browser. Both players use the same window.
 
 ## How to play online with a friend
 
-### Option A — Netlify Drop (easiest, free)
-1. Go to https://app.netlify.com/drop
-2. Drag the entire `trapgrid` folder onto the page
-3. You'll get a public URL — share it with your friend
-4. Both open the URL, one creates a room, shares the 6-letter code, friend joins
+The game uses Firebase Realtime Database for live sync — the config is already
+baked into `index.html`, so no setup needed. Just host the file anywhere:
 
-### Option B — GitHub Pages
-1. Push this folder to a GitHub repo
-2. Go to Settings → Pages → set source to main branch
-3. Share the generated URL
+### Option A — GitHub Pages (recommended)
+1. Push `index.html` to a GitHub repo
+2. Go to **Settings → Pages → set source to main branch**
+3. Share `https://YOUR-USERNAME.github.io/REPO-NAME` with your friend
+4. One player creates a room, shares the 6-letter code, friend joins
+
+### Option B — Netlify Drop (easiest, no account needed)
+1. Go to https://app.netlify.com/drop
+2. Drag `index.html` onto the page
+3. Share the generated URL with your friend
 
 ### Option C — Any static host
-Upload `index.html` to any static host (Vercel, Surge, Cloudflare Pages, etc.)
+Upload `index.html` to Vercel, Surge, Cloudflare Pages, etc.
 
 ## Game rules summary
 
