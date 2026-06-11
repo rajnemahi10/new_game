@@ -883,12 +883,11 @@
     async function saveRoom(d) { await fbInit(); await set(rRef(), d); }
     async function saveState(d) { await fbInit(); await set(sRef(), d); }
     async function loadRoom() { await fbInit(); const s = await get(rRef()); return s.exists() ? s.val() : null; }
-    async function loadState() { await fbInit(); const s = await get(sRef()); return s.exists() ? s.val() : null; }
 
-    // ── Navigation ─────────────────────────────────────────────────────────────
     function show(id) {
       document.querySelectorAll('.page').forEach(p => p.classList.remove('on'));
-      document.getElementById('pg-' + id).classList.add('on');
+      const target = document.getElementById('pg-' + id);
+      if (target) target.classList.add('on');
     }
 
     // ── Lobby & Connection ──────────────────────────────────────────────────────
@@ -904,9 +903,8 @@
       onValue(rRef(), snap => {
         const r = snap.val();
         if (r && r.guest) {
-          document.getElementById('wait-msg').textContent = r.guest + ' has joined!';
+          document.getElementById('wait-msg').textContent = r.guest + ' joined!';
           document.getElementById('start-btn').disabled = false;
-          document.getElementById('start-hint').textContent = 'Ready to start!';
         }
       });
     }
@@ -925,21 +923,24 @@
 
       onValue(rRef(), snap => {
         const rd = snap.val();
-        if (rd && rd.status === 'playing') {
-          bCfg = rd.bCfg;
-          // Start listening for state changes
-          onValue(sRef(), snapState => {
-            if (snapState.exists()) {
-              gState = snapState.val();
-              if (document.getElementById('pg-joining').classList.contains('on')) show('game');
-              renderGame();
-            }
-          });
+        if (rd && rd.status === 'playing' && rd.bCfg) {
+          bCfg = rd.bCfg; // Ensure bCfg is saved locally
+          initGameStateListener();
         }
       });
     }
 
-    // ── Game Logic ─────────────────────────────────────────────────────────────
+    function initGameStateListener() {
+      onValue(sRef(), snap => {
+        if (snap.exists()) {
+          gState = snap.val();
+          if (document.getElementById('pg-game').classList.contains('on') === false) show('game');
+          renderGame();
+        }
+      });
+    }
+
+    // ── Game Loop ──────────────────────────────────────────────────────────────
     async function doStart() {
       const r = await loadRoom();
       bCfg = { size: gSize, excluded: [...excluded], bonus: { ...bonusMap } };
@@ -955,18 +956,11 @@
         round: 1, log: [{ msg: "Game started!", cls: "" }], over: false,
       };
 
+      await saveState(gState);
       r.bCfg = bCfg;
       r.status = 'playing';
-      await saveState(gState);
-      await saveRoom(r); // Status update triggers the guest
-
-      onValue(sRef(), snap => {
-        if (snap.exists()) {
-          gState = snap.val();
-          show('game');
-          renderGame();
-        }
-      });
+      await saveRoom(r);
+      initGameStateListener();
     }
 
     function renderGame() {
@@ -988,47 +982,6 @@
       if (gState.over) showWinner();
     }
 
-    // [All other helper functions: renderBoard, renderMyChips, resolveTurn, etc. remain the same as your original script]
-    // Note: Make sure to copy the resolveTurn, checkSeqs, and placeCell functions from your previous code here.
-
-    function renderMyChips() {
-      const me = myIdx(), myPl = gState.players[me];
-      const wrap = document.getElementById('my-chips');
-      wrap.innerHTML = '';
-      const submitted = gState.moves[me].done;
-      Object.entries(myPl.pieces).forEach(([k, v]) => {
-        if (v <= 0) return;
-        const c = document.createElement('div');
-        c.className = 'chip' + (pending.piece === k ? ' sel' : '') + (submitted ? ' dim' : '');
-        c.textContent = ICONS[k] + ' ' + k + ' ×' + v;
-        if (!submitted) c.addEventListener('click', () => { pending.piece = k; renderGame(); });
-        wrap.appendChild(c);
-      });
-      const bw = document.getElementById('my-buy');
-      bw.innerHTML = '';
-      Object.keys(COST).forEach(k => {
-        const b = document.createElement('button');
-        b.className = 'bchip';
-        b.textContent = '+ ' + k + ' (' + COST[k] + ')';
-        b.disabled = myPl.pts < COST[k] || submitted;
-        b.addEventListener('click', () => buyPiece(k));
-        bw.appendChild(b);
-      });
-    }
-
-    function renderOpChips() {
-      const op = opIdx(), opPl = gState.players[op];
-      const wrap = document.getElementById('op-chips');
-      wrap.innerHTML = '';
-      Object.entries(opPl.pieces).forEach(([k, v]) => {
-        if (v <= 0) return;
-        const c = document.createElement('div');
-        c.className = 'chip dim';
-        c.textContent = ICONS[k] + ' ' + k + ' ×' + v;
-        wrap.appendChild(c);
-      });
-    }
-
     function renderBoard() {
       const n = bCfg.size, me = myIdx();
       const wrap = document.getElementById('gboard');
@@ -1039,166 +992,150 @@
       for (let i = 0; i < n * n; i++) {
         const cell = document.createElement('div');
         cell.className = 'gc';
-        const excl = bCfg.excluded && bCfg.excluded.includes(i);
-        const sq = gState.board[i];
-        const lk = gState.locked[i];
+        const isExcl = bCfg.excluded && bCfg.excluded.includes(i);
+        if (isExcl) { cell.classList.add('gx'); wrap.appendChild(cell); continue; }
 
-        if (excl) { cell.classList.add('gx'); wrap.appendChild(cell); continue; }
-        if (lk && !sq) cell.classList.add('gd');
-        else if (lk) cell.classList.add('glk');
+        const sq = gState.board[i];
+        const isLk = gState.locked[i];
+
+        if (isLk && !sq) cell.classList.add('gd');
+        else if (isLk) cell.classList.add('glk');
         else if (sq) cell.classList.add(sq.owner === 0 ? 'g1' : 'g2');
 
         if (sq) {
           const ic = document.createElement('div'); ic.className = 'pi'; ic.textContent = ICONS[sq.piece]; cell.appendChild(ic);
           const od = document.createElement('div'); od.className = 'od'; od.style.background = sq.owner === 0 ? '#1D9E75' : '#534AB7'; cell.appendChild(od);
         }
-        const bv = bCfg.bonus && bCfg.bonus[i];
-        if (bv && (!gState.usedBonus || !gState.usedBonus.includes(i))) {
+
+        if (bCfg.bonus && bCfg.bonus[i] && (!gState.usedBonus || !gState.usedBonus.includes(i))) {
+          const bv = bCfg.bonus[i];
           cell.classList.add(bv === 2 ? 'gbx2' : 'gbx3');
-          const bl = document.createElement('div'); bl.className = 'bl ' + (bv === 2 ? 'x2' : 'x3'); bl.textContent = '×' + bv; cell.appendChild(bl);
         }
+
         if (!submitted && pending.cell === i) cell.classList.add('gsel');
         if (submitted && gState.moves[me].cell === i) {
           const pd = document.createElement('div'); pd.className = 'pend'; cell.appendChild(pd);
         }
-        if (!lk && !excl && !submitted) cell.addEventListener('click', () => clickCell(i));
+
+        if (!isLk && !submitted) cell.onclick = () => {
+          if (!pending.piece) return;
+          if (sq && sq.owner === me) return;
+          pending.cell = i;
+          renderGame();
+        };
         wrap.appendChild(cell);
       }
     }
 
-    function clickCell(i) {
-      const me = myIdx();
-      if (gState.moves[me].done) return;
-      if (!pending.piece) return;
-      const sq = gState.board[i];
-      if (sq && sq.owner === me) return;
-      pending.cell = i;
-      renderGame();
-    }
-
     async function submitMove() {
       const me = myIdx();
-      if (!pending.piece || pending.cell === null) return;
-
-      // Update local state then push to Firebase
       gState.moves[me] = { done: true, cell: pending.cell, piece: pending.piece };
       pending = { piece: null, cell: null };
-
       await saveState(gState);
 
-      // Check if both are now done
-      if (gState.moves[0].done && gState.moves[1].done) {
-        resolveTurn();
+      // If both are done, Host processes the turn logic
+      if (gState.moves[0].done && gState.moves[1].done && myRole === 'host') {
+        setTimeout(resolveTurn, 100);
       }
     }
 
-    async function resolveTurn() {
-      if (myRole !== 'host') return; // Only host handles resolution to prevent double-processing
-
+    function resolveTurn() {
       const m0 = gState.moves[0], m1 = gState.moves[1];
       gState.players[0].pieces[m0.piece]--;
       gState.players[1].pieces[m1.piece]--;
 
       if (m0.cell === m1.cell) {
-        resolveSame(m0.cell, m0.piece, m1.piece);
+        const w = resolveVs(m0.piece, m1.piece);
+        if (w === 0) { gState.board[m0.cell] = { owner: 0, piece: m0.piece }; gState.players[0].pts += WORTH[m0.piece]; }
+        else if (w === 1) { gState.board[m0.cell] = { owner: 1, piece: m1.piece }; gState.players[1].pts += WORTH[m1.piece]; }
+        else gState.locked[m0.cell] = true;
       } else {
-        placeCell(m0.cell, 0, m0.piece);
-        placeCell(m1.cell, 1, m1.piece);
+        [m0, m1].forEach((m, idx) => {
+          const cell = m.cell;
+          if (gState.locked[cell]) return;
+          if (!gState.board[cell]) gState.board[cell] = { owner: idx, piece: m.piece };
+          else if (gState.board[cell].owner !== idx) {
+            const w = resolveVs(idx === 0 ? m.piece : gState.board[cell].piece, idx === 0 ? gState.board[cell].piece : m.piece);
+            if (w === idx) { gState.board[cell] = { owner: idx, piece: m.piece }; gState.players[idx].pts += WORTH[m.piece]; }
+            else if (w === -1) { gState.locked[cell] = true; gState.board[cell] = null; }
+          }
+        });
       }
 
       checkSeqs();
       gState.moves = [{ done: false, cell: null, piece: null }, { done: false, cell: null, piece: null }];
       gState.round++;
 
-      // End game check
       const n = bCfg.size;
       const play = []; for (let i = 0; i < n * n; i++) if (!bCfg.excluded.includes(i)) play.push(i);
-      if (play.every(i => gState.board[i] !== null || gState.locked[i])) gState.over = true;
-
-      await saveState(gState);
+      if (play.every(i => gState.board[i] || gState.locked[i])) gState.over = true;
+      saveState(gState);
     }
 
-    // Logic Functions (placeCell, resolveVs, resolveSame, checkSeqs)
     function resolveVs(a, b) {
       if (a === b) return -1;
-      if (a === 'goblin' && b === 'goblin') return -1;
-      if (b === 'goblin') return 0;
-      if (a === 'goblin') return 1;
-      if (TRAPS[a] === b) return 0;
-      if (TRAPS[b] === a) return 1;
+      if (b === 'goblin') return 0; if (a === 'goblin') return 1;
+      if (TRAPS[a] === b) return 0; if (TRAPS[b] === a) return 1;
       return -1;
-    }
-
-    function resolveSame(cell, p0, p1) {
-      const w = resolveVs(p0, p1);
-      if (w === 0) {
-        gState.board[cell] = { owner: 0, piece: p0 };
-        gState.players[0].pts += WORTH[p0];
-      } else if (w === 1) {
-        gState.board[cell] = { owner: 1, piece: p1 };
-        gState.players[1].pts += WORTH[p1];
-      } else {
-        gState.locked[cell] = true; gState.board[cell] = null;
-      }
-    }
-
-    function placeCell(cell, owner, piece) {
-      if (gState.locked[cell]) return;
-      const ex = gState.board[cell];
-      if (!ex) { gState.board[cell] = { owner, piece }; return; }
-      if (ex.owner === owner) return;
-
-      const p0piece = owner === 0 ? piece : ex.piece;
-      const p1piece = owner === 0 ? ex.piece : piece;
-      const w = resolveVs(p0piece, p1piece);
-      const actualW = owner === 0 ? w : (w === 0 ? 1 : w === -1 ? -1 : 0);
-
-      if (actualW === owner) {
-        gState.board[cell] = { owner, piece };
-        gState.players[owner].pts += WORTH[piece];
-      } else if (actualW === -1) {
-        gState.locked[cell] = true; gState.board[cell] = null;
-      }
     }
 
     function checkSeqs() {
       const n = bCfg.size;
       for (let p = 0; p < 2; p++) {
-        const op = 1 - p;
         const lines = [];
         for (let r = 0; r < n; r++) for (let c = 0; c < n - 2; c++) lines.push([r * n + c, r * n + c + 1, r * n + c + 2]);
         for (let c = 0; c < n; c++) for (let r = 0; r < n - 2; r++) lines.push([r * n + c, (r + 1) * n + c, (r + 2) * n + c]);
-
         lines.forEach(([a, m, b]) => {
           if (gState.locked[m]) return;
           const sa = gState.board[a], sm = gState.board[m], sb = gState.board[b];
-          if (!sa || !sm || !sb) return;
-          if (sa.owner !== p || sb.owner !== p || sm.owner !== op) return;
-          if (sa.piece !== sb.piece || TRAPS[sa.piece] !== sm.piece) return;
-
-          gState.players[p].pts += (WORTH[sa.piece] * 2 + WORTH[sm.piece]);
-          gState.locked[m] = true;
+          if (sa && sm && sb && sa.owner === p && sb.owner === p && sm.owner === (1 - p) && sa.piece === sb.piece && TRAPS[sa.piece] === sm.piece) {
+            gState.players[p].pts += (WORTH[sa.piece] * 2 + WORTH[sm.piece]);
+            gState.locked[m] = true;
+          }
         });
       }
     }
 
-    function renderStatusBar() {
-      const me = myIdx(), op = opIdx();
-      const txt = document.getElementById('sbar-txt');
-      if (gState.over) { txt.textContent = 'Game Over!'; return; }
-      if (!gState.moves[me].done) txt.innerHTML = pending.cell !== null ? 'Ready! <button class="btn btnp sbtn" onclick="submitMove()">Lock In</button>' : 'Select a piece and a square.';
-      else txt.textContent = 'Waiting for opponent...';
+    // Standard Helpers
+    function myIdx() { return myRole === 'host' ? 0 : 1; }
+    function opIdx() { return myRole === 'host' ? 1 : 0; }
+    function renderMyChips() {
+      const me = myIdx(), pl = gState.players[me], wrap = document.getElementById('my-chips');
+      wrap.innerHTML = '';
+      Object.entries(pl.pieces).forEach(([k, v]) => {
+        if (v <= 0) return;
+        const c = document.createElement('div');
+        c.className = 'chip' + (pending.piece === k ? ' sel' : '') + (gState.moves[me].done ? ' dim' : '');
+        c.textContent = ICONS[k] + ' ' + v;
+        c.onclick = () => { if (!gState.moves[me].done) { pending.piece = k; renderGame(); } };
+        wrap.appendChild(c);
+      });
     }
-
+    function renderOpChips() {
+      const op = opIdx(), pl = gState.players[op], wrap = document.getElementById('op-chips');
+      wrap.innerHTML = '';
+      Object.entries(pl.pieces).forEach(([k, v]) => {
+        if (v > 0) {
+          const c = document.createElement('div'); c.className = 'chip dim'; c.textContent = ICONS[k] + ' ' + v; wrap.appendChild(c);
+        }
+      });
+    }
+    function renderStatusBar() {
+      const me = myIdx(), txt = document.getElementById('sbar-txt');
+      if (gState.over) { txt.textContent = 'Game Over!'; return; }
+      if (!gState.moves[me].done) txt.innerHTML = pending.cell !== null ? '<button class="btn btnp" onclick="submitMove()">Lock In</button>' : 'Select piece & square';
+      else txt.textContent = 'Waiting...';
+    }
     function renderLog() {
       const box = document.getElementById('glog');
       if (gState.log) box.innerHTML = gState.log.map(e => `<p>${e.msg}</p>`).join('');
     }
+    async function buyPiece(p) {
+      const me = myIdx(), pl = gState.players[me];
+      if (pl.pts >= COST[p]) { pl.pts -= COST[p]; pl.pieces[p]++; await saveState(gState); renderGame(); }
+    }
 
-    function myIdx() { return myRole === 'host' ? 0 : 1; }
-    function opIdx() { return myRole === 'host' ? 1 : 0; }
-
-    // Builder Functions
+    // Builder
     function renderBuilder() {
       const wrap = document.getElementById('bd-shape');
       wrap.style.gridTemplateColumns = `repeat(${gSize},40px)`;
@@ -1211,16 +1148,14 @@
       }
     }
 
-    // Expose functions to window
     window.doCreate = doCreate; window.doJoin = doJoin; window.doStart = doStart;
-    window.submitMove = submitMove; window.setBMode = (m) => bMode = m;
+    window.submitMove = submitMove; window.buyPiece = buyPiece;
     window.setSize = (s, el) => { gSize = s; renderBuilder(); };
     window.buildTab = (t, el) => {
       document.getElementById('bt-size').style.display = t === 'size' ? 'block' : 'none';
       document.getElementById('bt-shape').style.display = t === 'shape' ? 'block' : 'none';
       renderBuilder();
     };
-
     fbInit();
   </script>
 
