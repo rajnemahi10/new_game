@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 type Piece = "wizard" | "warrior" | "dragon" | "goblin";
 type Role = "host" | "guest";
@@ -59,6 +59,10 @@ type SessionState = {
   name: string;
 };
 
+type SyncMessage =
+  | { type: "room"; room: Room }
+  | { type: "state"; code: string; state: GameState };
+
 const ICONS: Record<Piece, string> = {
   wizard: "🧙",
   warrior: "⚔️",
@@ -88,7 +92,7 @@ const TRAPS: Record<Piece, Piece | undefined> = {
 };
 
 const STORAGE_PREFIX = "trapgrid";
-const SESSION_KEY = `${STORAGE_PREFIX}:session`;
+const CHANNEL_NAME = "trapgrid-sync";
 
 const PIECE_ORDER: Piece[] = ["wizard", "warrior", "dragon", "goblin"];
 
@@ -116,7 +120,7 @@ function writeJson(key: string, value: unknown) {
 
 function readSession(): SessionState | null {
   try {
-    const raw = window.sessionStorage.getItem(SESSION_KEY);
+    const raw = window.sessionStorage.getItem(`${STORAGE_PREFIX}:session`);
     if (!raw) return null;
     return JSON.parse(raw) as SessionState;
   } catch {
@@ -126,10 +130,10 @@ function readSession(): SessionState | null {
 
 function writeSession(value: SessionState | null) {
   if (!value) {
-    window.sessionStorage.removeItem(SESSION_KEY);
+    window.sessionStorage.removeItem(`${STORAGE_PREFIX}:session`);
     return;
   }
-  window.sessionStorage.setItem(SESSION_KEY, JSON.stringify(value));
+  window.sessionStorage.setItem(`${STORAGE_PREFIX}:session`, JSON.stringify(value));
 }
 
 function makeCode() {
@@ -137,17 +141,7 @@ function makeCode() {
 }
 
 function blankPieces() {
-  return { wizard: 3, warrior: 3, dragon: 3, goblin: 1 };
-}
-
-function makeEmptyBoard(size: number) {
-  const board: Record<string, BoardPiece | null> = {};
-  const locked: Record<string, boolean> = {};
-  for (let i = 0; i < size * size; i += 1) {
-    board[String(i)] = null;
-    locked[String(i)] = false;
-  }
-  return { board, locked };
+  return { wizard: 3, warrior: 3, dragon: 3, goblin: 1 } satisfies Record<Piece, number>;
 }
 
 function cloneGameState(state: GameState): GameState {
@@ -172,7 +166,13 @@ function cloneGameState(state: GameState): GameState {
 }
 
 function createGameState(room: Room, setup: BoardSetup): GameState {
-  const { board, locked } = makeEmptyBoard(setup.size);
+  const board: Record<string, BoardPiece | null> = {};
+  const locked: Record<string, boolean> = {};
+  for (let i = 0; i < setup.size * setup.size; i += 1) {
+    board[String(i)] = null;
+    locked[String(i)] = false;
+  }
+
   return {
     setup: {
       size: setup.size,
@@ -324,16 +324,57 @@ function resolveTurn(state: GameState) {
   return next;
 }
 
-function roomPage(session: SessionState | null, room: Room | null): Page {
-  if (!session) return "lobby";
-  if (room?.status === "playing") return "game";
-  return session.role === "host" ? "waiting" : "joining";
-}
-
 function emptySetup(): BoardSetup {
   return { size: 6, excluded: [], bonus: {} };
 }
 
+// ------------------------------------------------------------------
+// useBroadcastChannel – synchronises state across browser tabs
+// ------------------------------------------------------------------
+function useBroadcastChannel() {
+  const channelRef = useRef<BroadcastChannel | null>(null);
+
+  // Returns a callback that other hooks in the component can call
+  const broadcast = useCallback((message: SyncMessage) => {
+    try {
+      channelRef.current?.postMessage(message);
+    } catch {
+      // channel might be closed
+    }
+  }, []);
+
+  // We expose the channel's message listener so the consumer
+  // can register its own handler.
+  const setOnMessage = useCallback((handler: (message: SyncMessage) => void) => {
+    if (channelRef.current) {
+      channelRef.current.onmessage = (event: MessageEvent) => {
+        handler(event.data as SyncMessage);
+      };
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const channel = new BroadcastChannel(CHANNEL_NAME);
+      channelRef.current = channel;
+    } catch {
+      // BroadcastChannel not supported – rely on storage events
+    }
+
+    return () => {
+      if (channelRef.current) {
+        channelRef.current.close();
+        channelRef.current = null;
+      }
+    };
+  }, []);
+
+  return { broadcast, setOnMessage };
+}
+
+// ------------------------------------------------------------------
+// App
+// ------------------------------------------------------------------
 function App() {
   const [name, setName] = useState("");
   const [joinCode, setJoinCode] = useState("");
@@ -349,77 +390,155 @@ function App() {
     cell: null,
   });
   const copyTimer = useRef<number | null>(null);
+  const pollTimer = useRef<number | null>(null);
 
-  const page = useMemo(() => roomPage(session, room), [session, room]);
+  const { broadcast, setOnMessage } = useBroadcastChannel();
+
+  const page: Page = (() => {
+    if (!session) return "lobby";
+    if (room?.status === "playing") return "game";
+    return session.role === "host" ? "waiting" : "joining";
+  })();
 
   const myIndex = session?.role === "host" ? 0 : 1;
   const opIndex = session?.role === "host" ? 1 : 0;
 
-  const saveRoom = (nextRoom: Room) => {
-    writeJson(roomKey(nextRoom.code), nextRoom);
-    setRoom(nextRoom);
-  };
-
-  const saveGame = (code: string, nextState: GameState) => {
-    writeJson(stateKey(code), nextState);
-    setGameState(nextState);
-  };
-
-  const refreshSession = (nextSession: SessionState | null) => {
-    writeSession(nextSession);
-    setSession(nextSession);
-    if (!nextSession) {
-      setRoom(null);
-      setGameState(null);
-      setPending({ piece: null, cell: null });
-      return;
-    }
-    const nextRoom = readJson<Room>(roomKey(nextSession.code));
-    const nextState = readJson<GameState>(stateKey(nextSession.code));
-    setRoom(nextRoom);
-    setGameState(nextState);
-    setPending({ piece: null, cell: null });
-  };
-
-  useEffect(() => {
-    if (!session) return;
-    const onStorage = (event: StorageEvent) => {
-      if (event.key !== roomKey(session.code) && event.key !== stateKey(session.code)) return;
-      const nextRoom = readJson<Room>(roomKey(session.code));
-      const nextState = readJson<GameState>(stateKey(session.code));
+  // --------------- helpers ---------------
+  const loadFromStorage = useCallback(
+    (code: string) => {
+      const nextRoom = readJson<Room>(roomKey(code));
+      const nextState = readJson<GameState>(stateKey(code));
       setRoom(nextRoom);
       setGameState(nextState);
+      return { nextRoom, nextState };
+    },
+    [],
+  );
+
+  const saveRoom = useCallback(
+    (nextRoom: Room) => {
+      writeJson(roomKey(nextRoom.code), nextRoom);
+      setRoom(nextRoom);
+      broadcast({ type: "room", room: nextRoom });
+    },
+    [broadcast],
+  );
+
+  const saveGame = useCallback(
+    (code: string, nextState: GameState) => {
+      writeJson(stateKey(code), nextState);
+      setGameState(nextState);
+      broadcast({ type: "state", code, state: nextState });
+    },
+    [broadcast],
+  );
+
+  const refreshSession = useCallback(
+    (nextSession: SessionState | null) => {
+      writeSession(nextSession);
+      setSession(nextSession);
+      if (!nextSession) {
+        setRoom(null);
+        setGameState(null);
+        setPending({ piece: null, cell: null });
+        return;
+      }
+      loadFromStorage(nextSession.code);
+      setPending({ piece: null, cell: null });
+    },
+    [loadFromStorage],
+  );
+
+  // --------------- sync: BroadcastChannel ---------------
+  useEffect(() => {
+    if (!session) return;
+
+    setOnMessage((message: SyncMessage) => {
+      if (message.type === "room" && message.room.code === session.code) {
+        setRoom(message.room);
+      } else if (message.type === "state" && message.code === session.code) {
+        setGameState(message.state);
+      }
+    });
+  }, [session, setOnMessage]);
+
+  // --------------- sync: storage events (fallback) ---------------
+  useEffect(() => {
+    if (!session) return;
+
+    const onStorage = (event: StorageEvent) => {
+      const rKey = roomKey(session.code);
+      const sKey = stateKey(session.code);
+      if (event.key !== rKey && event.key !== sKey) return;
+      loadFromStorage(session.code);
     };
 
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, [session]);
+  }, [session, loadFromStorage]);
 
+  // --------------- sync: polling (last-resort fallback) ---------------
   useEffect(() => {
     if (!session) return;
-    const nextRoom = readJson<Room>(roomKey(session.code));
-    if (!nextRoom) {
+
+    const poll = () => {
+      const rKey = roomKey(session.code);
+      const sKey = stateKey(session.code);
+      const storedRoom = readJson<Room>(rKey);
+      const storedState = readJson<GameState>(sKey);
+
+      setRoom((current) => {
+        if (storedRoom && JSON.stringify(storedRoom) !== JSON.stringify(current)) {
+          return storedRoom;
+        }
+        return current;
+      });
+
+      setGameState((current) => {
+        if (storedState && JSON.stringify(storedState) !== JSON.stringify(current)) {
+          return storedState;
+        }
+        return current;
+      });
+    };
+
+    // Poll every 800ms to pick up changes from other tabs
+    pollTimer.current = window.setInterval(poll, 800);
+    return () => {
+      if (pollTimer.current) {
+        window.clearInterval(pollTimer.current);
+        pollTimer.current = null;
+      }
+    };
+  }, [session]);
+
+  // --------------- load state on session change ---------------
+  useEffect(() => {
+    if (!session) return;
+    const r = readJson<Room>(roomKey(session.code));
+    if (!r) {
       refreshSession(null);
       return;
     }
-    const nextState = readJson<GameState>(stateKey(session.code));
-    setRoom(nextRoom);
-    setGameState(nextState);
-  }, [session]);
+    loadFromStorage(session.code);
+  }, [session, loadFromStorage, refreshSession]);
 
+  // --------------- resolve turn (host only) ---------------
   useEffect(() => {
     if (!session || session.role !== "host" || !gameState || gameState.over) return;
     if (!gameState.moves[0].done || !gameState.moves[1].done) return;
     const resolved = resolveTurn(gameState);
     saveGame(session.code, resolved);
-  }, [gameState, session]);
+  }, [gameState, session, saveGame]);
 
+  // --------------- cleanup timers ---------------
   useEffect(() => {
     return () => {
       if (copyTimer.current) window.clearTimeout(copyTimer.current);
     };
   }, []);
 
+  // --------------- handlers ---------------
   const copyCode = async () => {
     if (!room?.code) return;
     try {
@@ -434,7 +553,7 @@ function App() {
         }, 900);
       }
     } catch {
-      // No-op: clipboard may be unavailable.
+      // No-op
     }
   };
 
@@ -456,20 +575,19 @@ function App() {
       setError("Enter a 6-character room code.");
       return;
     }
-    const nextRoom = readJson<Room>(roomKey(code));
-    if (!nextRoom || nextRoom.guest) {
+    const existingRoom = readJson<Room>(roomKey(code));
+    if (!existingRoom || existingRoom.guest) {
       setError("Room not found or already full.");
       return;
     }
-
     const guestName = name.trim() || "Player 2";
-    const updatedRoom: Room = { ...nextRoom, guest: guestName };
+    const updatedRoom: Room = { ...existingRoom, guest: guestName };
     saveRoom(updatedRoom);
     refreshSession({ code, role: "guest", name: guestName });
-
-    const nextState = readJson<GameState>(stateKey(code));
-    if (nextState && updatedRoom.status === "playing") {
-      setGameState(nextState);
+    // Also check if there's already a game state (race condition guard)
+    const existingState = readJson<GameState>(stateKey(code));
+    if (existingState && updatedRoom.status === "playing") {
+      setGameState(existingState);
     }
   };
 
@@ -481,6 +599,7 @@ function App() {
     }
     const nextRoom: Room = { ...room, status: "playing" };
     const nextState = createGameState(nextRoom, setup);
+    // Save game state first, then room
     saveGame(room.code, nextState);
     saveRoom(nextRoom);
   };
@@ -545,6 +664,7 @@ function App() {
     saveGame(session.code, next);
   };
 
+  // --------------- render helpers ---------------
   const renderBuilderGrid = (kind: "shape" | "bonus") => {
     const size = setup.size;
     return (
@@ -582,14 +702,19 @@ function App() {
     const board = gameState?.board ?? {};
     const locked = gameState?.locked ?? {};
     const isLoading = !gameState;
+    const submitted = !!gameState?.moves[myIndex].done;
+    const pendingCell = pending.cell;
+
     return (
-      <div className={isLoading ? "gb loading-board" : "gb"} style={{ gridTemplateColumns: `repeat(${size},52px)` }}>
+      <div
+        className={isLoading ? "gb loading-board" : "gb"}
+        style={{ gridTemplateColumns: `repeat(${size},52px)` }}
+      >
         {Array.from({ length: size * size }, (_, index) => {
           const key = String(index);
           const isExcluded = excluded.includes(index);
           const sq = board[key];
           const isLocked = !!locked[key];
-          const submitted = !!gameState?.moves[myIndex].done;
           const bonusType = bonus[key];
           const classes = ["gc"];
 
@@ -600,7 +725,7 @@ function App() {
           if (bonusType && (!gameState?.usedBonus || !gameState.usedBonus.includes(index))) {
             classes.push(bonusType === 2 ? "gbx2" : "gbx3");
           }
-          if (!submitted && pending.cell === index) classes.push("gsel");
+          if (!submitted && pendingCell === index) classes.push("gsel");
 
           return (
             <div
@@ -626,8 +751,10 @@ function App() {
     );
   };
 
+  // --------------- render ---------------
   return (
     <>
+      {/* LOBBY */}
       <div id="pg-lobby" className={`page ${page === "lobby" ? "on" : ""}`}>
         <div className="lw">
           <div className="lc">
@@ -669,6 +796,7 @@ function App() {
         </div>
       </div>
 
+      {/* WAITING (host) */}
       <div id="pg-waiting" className={`page ${page === "waiting" ? "on" : ""}`}>
         <div style={{ maxWidth: 680, margin: "0 auto" }}>
           <div className="flex mt20" style={{ marginBottom: 16 }}>
@@ -718,20 +846,23 @@ function App() {
           </div>
 
           <div id="bt-shape" style={{ display: builderTab === "shape" ? "block" : "none" }}>
-            <p style={{ fontSize: 12, color: "var(--text2)", marginBottom: 8 }}>Click cells to exclude them from play.</p>
+            <p style={{ fontSize: 12, color: "var(--text2)", marginBottom: 8 }}>
+              Click cells to exclude them from play.
+            </p>
             {renderBuilderGrid("shape")}
           </div>
 
           <div id="bt-bonus" style={{ display: builderTab === "bonus" ? "block" : "none" }}>
             <div className="flex" style={{ gap: 6, marginBottom: 8 }}>
-              <button
-                className={`btn sbtn ${bonusMode === "normal" ? "on" : ""}`}
-                onClick={() => setBonusMode("normal")}
-              >
+              <button className={`btn sbtn ${bonusMode === "normal" ? "on" : ""}`} onClick={() => setBonusMode("normal")}>
                 Normal
               </button>
-              <button className={`btn sbtn ${bonusMode === "x2" ? "on" : ""}`} onClick={() => setBonusMode("x2")}>Paint ×2</button>
-              <button className={`btn sbtn ${bonusMode === "x3" ? "on" : ""}`} onClick={() => setBonusMode("x3")}>Paint ×3</button>
+              <button className={`btn sbtn ${bonusMode === "x2" ? "on" : ""}`} onClick={() => setBonusMode("x2")}>
+                Paint ×2
+              </button>
+              <button className={`btn sbtn ${bonusMode === "x3" ? "on" : ""}`} onClick={() => setBonusMode("x3")}>
+                Paint ×3
+              </button>
             </div>
             <p style={{ fontSize: 12, color: "var(--text2)", marginBottom: 8 }}>
               Click cells to set bonus type. Click again to clear.
@@ -750,17 +881,21 @@ function App() {
         </div>
       </div>
 
+      {/* JOINING (guest) */}
       <div id="pg-joining" className={`page ${page === "joining" ? "on" : ""}`}>
         <div style={{ maxWidth: 480, margin: "80px auto", textAlign: "center" }}>
           <h2 style={{ marginBottom: 8 }}>Joined!</h2>
           <p style={{ color: "var(--text2)", marginBottom: 20 }}>Waiting for the host to start the game.</p>
           <div className="notice" style={{ justifyContent: "center" }}>
             <span className="pulse" />
-            <span>{room?.status === "playing" ? "Loading the board..." : "Host is setting up the board..."}</span>
+            <span>
+              {room?.status === "playing" ? "The game has started!" : "Host is setting up the board..."}
+            </span>
           </div>
         </div>
       </div>
 
+      {/* GAME */}
       <div id="pg-game" className={`page ${page === "game" ? "on" : ""}`}>
         <div className="gl">
           <div className="sb">
@@ -836,7 +971,11 @@ function App() {
 
           <div className="ba">
             <div className="sbar" id="sbar">
-              <span className="pulse" id="sbar-pulse" style={{ display: gameState && !gameState.moves[myIndex].done ? "inline-block" : "none" }} />
+              <span
+                className="pulse"
+                id="sbar-pulse"
+                style={{ display: gameState && !gameState.moves[myIndex].done ? "inline-block" : "none" }}
+              />
               <span id="sbar-txt">
                 {gameState?.over
                   ? "Game Over!"
@@ -885,6 +1024,7 @@ function App() {
         </div>
       </div>
 
+      {/* WINNER OVERLAY */}
       <div className={`wov ${gameState?.over ? "on" : ""}`}>
         <div className="wc">
           <h2>
