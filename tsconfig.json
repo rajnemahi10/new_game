@@ -16,7 +16,7 @@
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    /* Path mapping — baseUrl required for paths; silence TS6 deprecation warning */
+    /* Path mapping */
     "ignoreDeprecations": "5.0",
     "baseUrl": ".",
     "paths": {
