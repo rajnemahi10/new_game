@@ -291,43 +291,49 @@ select:focus {
 
 .bgrid {
   display: inline-grid;
-  gap: 2px;
+  gap: 3px;
+  background: var(--bg2);
+  border: 1.5px solid var(--border2);
+  border-radius: 10px;
+  padding: 10px;
 }
 
 .bc {
   width: 40px;
   height: 40px;
-  border-radius: 4px;
-  border: 0.5px solid var(--border);
-  background: var(--bg2);
+  border-radius: 6px;
+  border: 1.5px solid var(--border2);
+  background: var(--bg);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 10px;
-  font-weight: 500;
+  font-weight: 600;
   user-select: none;
   transition: background 0.1s, transform 0.1s, border-color 0.1s;
 }
 
 .bc:hover {
-  background: var(--bg3);
+  background: var(--bg2);
+  border-color: var(--teal-400);
 }
 
 .bc.excl {
   background: var(--bg3);
-  opacity: 0.25;
+  opacity: 0.38;
+  border-style: dashed;
 }
 
 .bc.bx2 {
   background: var(--amber-50);
-  border: 1.5px solid var(--amber-400);
+  border: 2px solid var(--amber-400);
   color: var(--amber-600);
 }
 
 .bc.bx3 {
   background: var(--coral-50);
-  border: 1.5px solid var(--coral-400);
+  border: 2px solid var(--coral-400);
   color: var(--coral-600);
 }
 
@@ -442,17 +448,42 @@ select:focus {
   cursor: not-allowed;
 }
 
+/* --- Board - made much more visible --- */
+.board-wrap {
+  position: relative;
+  display: inline-block;
+  background: var(--bg2);
+  border: 1.5px solid var(--border2);
+  border-radius: 12px;
+  padding: 14px;
+  box-shadow: 0 1px 4px rgba(0,0,0,.06);
+}
+
+.board-loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  border-radius: 12px;
+  font-size: 13px;
+  color: var(--text2);
+  backdrop-filter: blur(1.5px);
+}
+
 .gb {
   display: inline-grid;
-  gap: 2px;
+  gap: 4px;
 }
 
 .gc {
-  width: 52px;
-  height: 52px;
-  border-radius: 4px;
-  border: 0.5px solid var(--border);
-  background: var(--bg2);
+  width: 54px;
+  height: 54px;
+  border-radius: 8px;
+  border: 1.5px solid var(--border2) !important;
+  background: var(--bg) !important;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -460,21 +491,25 @@ select:focus {
   cursor: pointer;
   position: relative;
   transition: background 0.1s, transform 0.1s, border-color 0.1s, box-shadow 0.1s;
+  box-shadow: 0 1px 0 rgba(0,0,0,.03);
 }
 
 .gc:hover:not(.gx):not(.gd):not(.glk) {
-  border-color: var(--border2);
+  border-color: var(--teal-400) !important;
+  background: var(--bg2) !important;
+  transform: translateY(-1px);
 }
 
 .gc.gx {
-  background: var(--bg3);
-  opacity: 0.18;
+  background: var(--bg3) !important;
+  opacity: .32;
   cursor: default;
+  border-style: dashed !important;
 }
 
 .gc.gd {
-  background: var(--bg3);
-  opacity: 0.4;
+  background: var(--bg3) !important;
+  opacity: .55;
   cursor: default;
 }
 
@@ -483,26 +518,27 @@ select:focus {
 }
 
 .gc.g1 {
-  background: var(--p1bg);
-  border-color: var(--p1b);
+  background: var(--p1bg) !important;
+  border-color: var(--p1b) !important;
 }
 
 .gc.g2 {
-  background: var(--p2bg);
-  border-color: var(--p2b);
+  background: var(--p2bg) !important;
+  border-color: var(--p2b) !important;
 }
 
 .gc.gsel {
-  outline: 2px solid var(--teal-400);
+  outline: 2.5px solid var(--teal-400);
   outline-offset: 1px;
+  border-color: var(--teal-400) !important;
 }
 
 .gc.gbx2 {
-  box-shadow: inset 0 0 0 2px var(--amber-400);
+  box-shadow: inset 0 0 0 2.5px var(--amber-400);
 }
 
 .gc.gbx3 {
-  box-shadow: inset 0 0 0 2px var(--coral-400);
+  box-shadow: inset 0 0 0 2.5px var(--coral-400);
 }
 
 .gc .pi {
@@ -738,16 +774,22 @@ select:focus {
     min-width: 100%;
   }
 
+  .board-wrap {
+    padding: 10px;
+  }
+
   .gc {
     width: 44px;
     height: 44px;
+    border-radius: 7px;
   }
 
   .gb {
-    gap: 1px;
+    gap: 3px;
   }
 
   .bgrid {
-    gap: 1px;
+    gap: 2px;
+    padding: 8px;
   }
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Piece = "wizard" | "warrior" | "dragon" | "goblin";
 type Role = "host" | "guest";
@@ -59,10 +59,6 @@ type SessionState = {
   name: string;
 };
 
-type SyncMessage =
-  | { type: "room"; room: Room }
-  | { type: "state"; code: string; state: GameState };
-
 const ICONS: Record<Piece, string> = {
   wizard: "🧙",
   warrior: "⚔️",
@@ -92,7 +88,7 @@ const TRAPS: Record<Piece, Piece | undefined> = {
 };
 
 const STORAGE_PREFIX = "trapgrid";
-const CHANNEL_NAME = "trapgrid-sync";
+const SESSION_KEY = `${STORAGE_PREFIX}:session`;
 
 const PIECE_ORDER: Piece[] = ["wizard", "warrior", "dragon", "goblin"];
 
@@ -120,7 +116,7 @@ function writeJson(key: string, value: unknown) {
 
 function readSession(): SessionState | null {
   try {
-    const raw = window.sessionStorage.getItem(`${STORAGE_PREFIX}:session`);
+    const raw = window.sessionStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     return JSON.parse(raw) as SessionState;
   } catch {
@@ -130,10 +126,10 @@ function readSession(): SessionState | null {
 
 function writeSession(value: SessionState | null) {
   if (!value) {
-    window.sessionStorage.removeItem(`${STORAGE_PREFIX}:session`);
+    window.sessionStorage.removeItem(SESSION_KEY);
     return;
   }
-  window.sessionStorage.setItem(`${STORAGE_PREFIX}:session`, JSON.stringify(value));
+  window.sessionStorage.setItem(SESSION_KEY, JSON.stringify(value));
 }
 
 function makeCode() {
@@ -141,7 +137,17 @@ function makeCode() {
 }
 
 function blankPieces() {
-  return { wizard: 3, warrior: 3, dragon: 3, goblin: 1 } satisfies Record<Piece, number>;
+  return { wizard: 3, warrior: 3, dragon: 3, goblin: 1 };
+}
+
+function makeEmptyBoard(size: number) {
+  const board: Record<string, BoardPiece | null> = {};
+  const locked: Record<string, boolean> = {};
+  for (let i = 0; i < size * size; i += 1) {
+    board[String(i)] = null;
+    locked[String(i)] = false;
+  }
+  return { board, locked };
 }
 
 function cloneGameState(state: GameState): GameState {
@@ -166,13 +172,7 @@ function cloneGameState(state: GameState): GameState {
 }
 
 function createGameState(room: Room, setup: BoardSetup): GameState {
-  const board: Record<string, BoardPiece | null> = {};
-  const locked: Record<string, boolean> = {};
-  for (let i = 0; i < setup.size * setup.size; i += 1) {
-    board[String(i)] = null;
-    locked[String(i)] = false;
-  }
-
+  const { board, locked } = makeEmptyBoard(setup.size);
   return {
     setup: {
       size: setup.size,
@@ -324,57 +324,16 @@ function resolveTurn(state: GameState) {
   return next;
 }
 
+function roomPage(session: SessionState | null, room: Room | null): Page {
+  if (!session) return "lobby";
+  if (room?.status === "playing") return "game";
+  return session.role === "host" ? "waiting" : "joining";
+}
+
 function emptySetup(): BoardSetup {
   return { size: 6, excluded: [], bonus: {} };
 }
 
-// ------------------------------------------------------------------
-// useBroadcastChannel – synchronises state across browser tabs
-// ------------------------------------------------------------------
-function useBroadcastChannel() {
-  const channelRef = useRef<BroadcastChannel | null>(null);
-
-  // Returns a callback that other hooks in the component can call
-  const broadcast = useCallback((message: SyncMessage) => {
-    try {
-      channelRef.current?.postMessage(message);
-    } catch {
-      // channel might be closed
-    }
-  }, []);
-
-  // We expose the channel's message listener so the consumer
-  // can register its own handler.
-  const setOnMessage = useCallback((handler: (message: SyncMessage) => void) => {
-    if (channelRef.current) {
-      channelRef.current.onmessage = (event: MessageEvent) => {
-        handler(event.data as SyncMessage);
-      };
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      const channel = new BroadcastChannel(CHANNEL_NAME);
-      channelRef.current = channel;
-    } catch {
-      // BroadcastChannel not supported – rely on storage events
-    }
-
-    return () => {
-      if (channelRef.current) {
-        channelRef.current.close();
-        channelRef.current = null;
-      }
-    };
-  }, []);
-
-  return { broadcast, setOnMessage };
-}
-
-// ------------------------------------------------------------------
-// App
-// ------------------------------------------------------------------
 function App() {
   const [name, setName] = useState("");
   const [joinCode, setJoinCode] = useState("");
@@ -390,155 +349,103 @@ function App() {
     cell: null,
   });
   const copyTimer = useRef<number | null>(null);
-  const pollTimer = useRef<number | null>(null);
 
-  const { broadcast, setOnMessage } = useBroadcastChannel();
+  const page = useMemo(() => roomPage(session, room), [session, room]);
 
-  const page: Page = (() => {
-    if (!session) return "lobby";
-    if (room?.status === "playing") return "game";
-    return session.role === "host" ? "waiting" : "joining";
-  })();
+  const myIndex = session?.role === "guest" ? 1 : 0;
+  const opIndex = myIndex === 0 ? 1 : 0;
 
-  const myIndex = session?.role === "host" ? 0 : 1;
-  const opIndex = session?.role === "host" ? 1 : 0;
+  const saveRoom = (nextRoom: Room) => {
+    writeJson(roomKey(nextRoom.code), nextRoom);
+    setRoom(nextRoom);
+  };
 
-  // --------------- helpers ---------------
-  const loadFromStorage = useCallback(
-    (code: string) => {
-      const nextRoom = readJson<Room>(roomKey(code));
-      const nextState = readJson<GameState>(stateKey(code));
-      setRoom(nextRoom);
-      setGameState(nextState);
-      return { nextRoom, nextState };
-    },
-    [],
-  );
+  const saveGame = (code: string, nextState: GameState) => {
+    writeJson(stateKey(code), nextState);
+    setGameState(nextState);
+  };
 
-  const saveRoom = useCallback(
-    (nextRoom: Room) => {
-      writeJson(roomKey(nextRoom.code), nextRoom);
-      setRoom(nextRoom);
-      broadcast({ type: "room", room: nextRoom });
-    },
-    [broadcast],
-  );
-
-  const saveGame = useCallback(
-    (code: string, nextState: GameState) => {
-      writeJson(stateKey(code), nextState);
-      setGameState(nextState);
-      broadcast({ type: "state", code, state: nextState });
-    },
-    [broadcast],
-  );
-
-  const refreshSession = useCallback(
-    (nextSession: SessionState | null) => {
-      writeSession(nextSession);
-      setSession(nextSession);
-      if (!nextSession) {
-        setRoom(null);
-        setGameState(null);
-        setPending({ piece: null, cell: null });
-        return;
-      }
-      loadFromStorage(nextSession.code);
+  const refreshSession = (nextSession: SessionState | null) => {
+    writeSession(nextSession);
+    setSession(nextSession);
+    if (!nextSession) {
+      setRoom(null);
+      setGameState(null);
       setPending({ piece: null, cell: null });
-    },
-    [loadFromStorage],
-  );
+      return;
+    }
+    const nextRoom = readJson<Room>(roomKey(nextSession.code));
+    const nextState = readJson<GameState>(stateKey(nextSession.code));
+    setRoom(nextRoom);
+    setGameState(nextState);
+    setPending({ piece: null, cell: null });
+  };
 
-  // --------------- sync: BroadcastChannel ---------------
+  // Aggressive localStorage sync - fixes board not appearing for guest/host
   useEffect(() => {
     if (!session) return;
-
-    setOnMessage((message: SyncMessage) => {
-      if (message.type === "room" && message.room.code === session.code) {
-        setRoom(message.room);
-      } else if (message.type === "state" && message.code === session.code) {
-        setGameState(message.state);
+    const pull = () => {
+      const nextRoom = readJson<Room>(roomKey(session.code));
+      const nextState = readJson<GameState>(stateKey(session.code));
+      if (nextRoom) setRoom(nextRoom);
+      if (nextState) setGameState((prev) => {
+        // avoid unnecessary re-renders, but always take fresh state if round changed or moves changed
+        if (!prev) return nextState;
+        return JSON.stringify(prev) !== JSON.stringify(nextState) ? nextState : prev;
+      });
+      if (!nextRoom && session) {
+        // room was deleted – bounce to lobby
+        refreshSession(null);
       }
-    });
-  }, [session, setOnMessage]);
+    };
 
-  // --------------- sync: storage events (fallback) ---------------
-  useEffect(() => {
-    if (!session) return;
+    // initial pull
+    pull();
 
     const onStorage = (event: StorageEvent) => {
-      const rKey = roomKey(session.code);
-      const sKey = stateKey(session.code);
-      if (event.key !== rKey && event.key !== sKey) return;
-      loadFromStorage(session.code);
+      if (!event.key) return;
+      if (event.key === roomKey(session.code) || event.key === stateKey(session.code)) {
+        pull();
+      }
     };
 
     window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, [session, loadFromStorage]);
+    const iv = window.setInterval(pull, 450); // same-tab + cross-tab reliable sync
+    const visHandler = () => { if (document.visibilityState === "visible") pull(); };
+    document.addEventListener("visibilitychange", visHandler);
 
-  // --------------- sync: polling (last-resort fallback) ---------------
-  useEffect(() => {
-    if (!session) return;
-
-    const poll = () => {
-      const rKey = roomKey(session.code);
-      const sKey = stateKey(session.code);
-      const storedRoom = readJson<Room>(rKey);
-      const storedState = readJson<GameState>(sKey);
-
-      setRoom((current) => {
-        if (storedRoom && JSON.stringify(storedRoom) !== JSON.stringify(current)) {
-          return storedRoom;
-        }
-        return current;
-      });
-
-      setGameState((current) => {
-        if (storedState && JSON.stringify(storedState) !== JSON.stringify(current)) {
-          return storedState;
-        }
-        return current;
-      });
-    };
-
-    // Poll every 800ms to pick up changes from other tabs
-    pollTimer.current = window.setInterval(poll, 800);
     return () => {
-      if (pollTimer.current) {
-        window.clearInterval(pollTimer.current);
-        pollTimer.current = null;
-      }
+      window.removeEventListener("storage", onStorage);
+      window.clearInterval(iv);
+      document.removeEventListener("visibilitychange", visHandler);
     };
-  }, [session]);
+  }, [session?.code]);
 
-  // --------------- load state on session change ---------------
   useEffect(() => {
     if (!session) return;
-    const r = readJson<Room>(roomKey(session.code));
-    if (!r) {
+    const nextRoom = readJson<Room>(roomKey(session.code));
+    if (!nextRoom) {
       refreshSession(null);
       return;
     }
-    loadFromStorage(session.code);
-  }, [session, loadFromStorage, refreshSession]);
+    const nextState = readJson<GameState>(stateKey(session.code));
+    setRoom(nextRoom);
+    if (nextState) setGameState(nextState);
+  }, [session?.code]);
 
-  // --------------- resolve turn (host only) ---------------
   useEffect(() => {
     if (!session || session.role !== "host" || !gameState || gameState.over) return;
     if (!gameState.moves[0].done || !gameState.moves[1].done) return;
     const resolved = resolveTurn(gameState);
     saveGame(session.code, resolved);
-  }, [gameState, session, saveGame]);
+  }, [gameState, session]);
 
-  // --------------- cleanup timers ---------------
   useEffect(() => {
     return () => {
       if (copyTimer.current) window.clearTimeout(copyTimer.current);
     };
   }, []);
 
-  // --------------- handlers ---------------
   const copyCode = async () => {
     if (!room?.code) return;
     try {
@@ -553,7 +460,7 @@ function App() {
         }, 900);
       }
     } catch {
-      // No-op
+      // No-op: clipboard may be unavailable.
     }
   };
 
@@ -575,19 +482,20 @@ function App() {
       setError("Enter a 6-character room code.");
       return;
     }
-    const existingRoom = readJson<Room>(roomKey(code));
-    if (!existingRoom || existingRoom.guest) {
+    const nextRoom = readJson<Room>(roomKey(code));
+    if (!nextRoom || nextRoom.guest) {
       setError("Room not found or already full.");
       return;
     }
+
     const guestName = name.trim() || "Player 2";
-    const updatedRoom: Room = { ...existingRoom, guest: guestName };
+    const updatedRoom: Room = { ...nextRoom, guest: guestName };
     saveRoom(updatedRoom);
     refreshSession({ code, role: "guest", name: guestName });
-    // Also check if there's already a game state (race condition guard)
-    const existingState = readJson<GameState>(stateKey(code));
-    if (existingState && updatedRoom.status === "playing") {
-      setGameState(existingState);
+
+    const nextState = readJson<GameState>(stateKey(code));
+    if (nextState && updatedRoom.status === "playing") {
+      setGameState(nextState);
     }
   };
 
@@ -599,7 +507,6 @@ function App() {
     }
     const nextRoom: Room = { ...room, status: "playing" };
     const nextState = createGameState(nextRoom, setup);
-    // Save game state first, then room
     saveGame(room.code, nextState);
     saveRoom(nextRoom);
   };
@@ -664,7 +571,6 @@ function App() {
     saveGame(session.code, next);
   };
 
-  // --------------- render helpers ---------------
   const renderBuilderGrid = (kind: "shape" | "bonus") => {
     const size = setup.size;
     return (
@@ -696,70 +602,77 @@ function App() {
   };
 
   const renderGameBoard = () => {
-    const size = gameState?.setup.size ?? setup.size;
-    const excluded = gameState?.setup.excluded ?? setup.excluded;
-    const bonus = gameState?.setup.bonus ?? setup.bonus;
+    // Always render a board, even if gameState is still syncing - prevents "invisible board" flash
+    const size = gameState?.setup.size ?? 6;
+    const excluded = gameState?.setup.excluded ?? [];
+    const bonus = gameState?.setup.bonus ?? {};
     const board = gameState?.board ?? {};
     const locked = gameState?.locked ?? {};
     const isLoading = !gameState;
-    const submitted = !!gameState?.moves[myIndex].done;
-    const pendingCell = pending.cell;
+    const submitted = !!gameState?.moves[myIndex]?.done;
 
     return (
-      <div
-        className={isLoading ? "gb loading-board" : "gb"}
-        style={{ gridTemplateColumns: `repeat(${size},52px)` }}
-      >
-        {Array.from({ length: size * size }, (_, index) => {
-          const key = String(index);
-          const isExcluded = excluded.includes(index);
-          const sq = board[key];
-          const isLocked = !!locked[key];
-          const bonusType = bonus[key];
-          const classes = ["gc"];
+      <div className="board-wrap">
+        <div className={isLoading ? "gb loading-board" : "gb"} style={{ gridTemplateColumns: `repeat(${size}, 54px)` }}>
+          {Array.from({ length: size * size }, (_, index) => {
+            const key = String(index);
+            const isExcluded = excluded.includes(index);
+            const sq = board[key] as BoardPiece | null | undefined;
+            const isLocked = !!locked[key];
+            const bonusType = bonus[key];
+            const classes = ["gc"];
 
-          if (isExcluded) classes.push("gx");
-          else if (isLocked && !sq) classes.push("gd");
-          else if (isLocked) classes.push("glk");
-          else if (sq) classes.push(sq.owner === 0 ? "g1" : "g2");
-          if (bonusType && (!gameState?.usedBonus || !gameState.usedBonus.includes(index))) {
-            classes.push(bonusType === 2 ? "gbx2" : "gbx3");
-          }
-          if (!submitted && pendingCell === index) classes.push("gsel");
+            if (isExcluded) classes.push("gx");
+            else if (isLocked && !sq) classes.push("gd");
+            else if (isLocked) classes.push("glk");
+            else if (sq) classes.push(sq.owner === 0 ? "g1" : "g2");
+            if (bonusType && (!gameState?.usedBonus || !gameState.usedBonus.includes(index))) {
+              classes.push(bonusType === 2 ? "gbx2" : "gbx3");
+            }
+            if (!submitted && pending.cell === index) classes.push("gsel");
 
-          return (
-            <div
-              key={key}
-              className={classes.join(" ")}
-              onClick={() => {
-                if (isLoading || isExcluded || isLocked || submitted) return;
-                if (!pending.piece) return;
-                if (sq && sq.owner === myIndex) return;
-                chooseCell(index);
-              }}
-            >
-              {sq ? <div className="pi">{ICONS[sq.piece]}</div> : null}
-              {sq ? <div className="od" style={{ background: sq.owner === 0 ? "#1D9E75" : "#534AB7" }} /> : null}
-              {bonusType && (!gameState?.usedBonus || !gameState.usedBonus.includes(index)) ? (
-                <div className={`bl ${bonusType === 2 ? "x2" : "x3"}`}>×{bonusType}</div>
-              ) : null}
-              {!isLoading && submitted && gameState?.moves[myIndex].cell === index ? <div className="pend" /> : null}
-            </div>
-          );
-        })}
+            return (
+              <div
+                key={key}
+                className={classes.join(" ")}
+                onClick={() => {
+                  if (isLoading || isExcluded || isLocked || submitted) return;
+                  if (!pending.piece) return;
+                  if (sq && sq.owner === myIndex) return;
+                  chooseCell(index);
+                }}
+                title={
+                  isExcluded ? "Excluded" :
+                  sq ? `${gameState?.players[sq.owner]?.name ?? (sq.owner===0?"P1":"P2")} – ${sq.piece}` :
+                  bonusType ? `Bonus ×${bonusType}` : "Empty"
+                }
+              >
+                {sq ? <div className="pi">{ICONS[sq.piece]}</div> : null}
+                {sq ? <div className="od" style={{ background: sq.owner === 0 ? "#1D9E75" : "#534AB7" }} /> : null}
+                {bonusType && (!gameState?.usedBonus || !gameState.usedBonus.includes(index)) ? (
+                  <div className={`bl ${bonusType === 2 ? "x2" : "x3"}`}>×{bonusType}</div>
+                ) : null}
+                {!isLoading && submitted && gameState?.moves[myIndex].cell === index ? <div className="pend" /> : null}
+              </div>
+            );
+          })}
+        </div>
+        {isLoading && (
+          <div className="board-loading-overlay">
+            <span className="pulse" /> Syncing board…
+          </div>
+        )}
       </div>
     );
   };
 
-  // --------------- render ---------------
   return (
     <>
-      {/* LOBBY */}
       <div id="pg-lobby" className={`page ${page === "lobby" ? "on" : ""}`}>
         <div className="lw">
           <div className="lc">
             <h1>TrapGrid</h1>
-            <p className="sub">Simultaneous strategy - trap your opponent's pieces to claim the board.</p>
+            <p className="sub">Simultaneous strategy — trap your opponent's pieces to claim the board. Open in two tabs to play locally.</p>
             <div className="fld">
               <label htmlFor="inp-name">Your name</label>
               <input
@@ -796,7 +709,6 @@ function App() {
         </div>
       </div>
 
-      {/* WAITING (host) */}
       <div id="pg-waiting" className={`page ${page === "waiting" ? "on" : ""}`}>
         <div style={{ maxWidth: 680, margin: "0 auto" }}>
           <div className="flex mt20" style={{ marginBottom: 16 }}>
@@ -846,23 +758,20 @@ function App() {
           </div>
 
           <div id="bt-shape" style={{ display: builderTab === "shape" ? "block" : "none" }}>
-            <p style={{ fontSize: 12, color: "var(--text2)", marginBottom: 8 }}>
-              Click cells to exclude them from play.
-            </p>
+            <p style={{ fontSize: 12, color: "var(--text2)", marginBottom: 8 }}>Click cells to exclude them from play.</p>
             {renderBuilderGrid("shape")}
           </div>
 
           <div id="bt-bonus" style={{ display: builderTab === "bonus" ? "block" : "none" }}>
             <div className="flex" style={{ gap: 6, marginBottom: 8 }}>
-              <button className={`btn sbtn ${bonusMode === "normal" ? "on" : ""}`} onClick={() => setBonusMode("normal")}>
+              <button
+                className={`btn sbtn ${bonusMode === "normal" ? "on" : ""}`}
+                onClick={() => setBonusMode("normal")}
+              >
                 Normal
               </button>
-              <button className={`btn sbtn ${bonusMode === "x2" ? "on" : ""}`} onClick={() => setBonusMode("x2")}>
-                Paint ×2
-              </button>
-              <button className={`btn sbtn ${bonusMode === "x3" ? "on" : ""}`} onClick={() => setBonusMode("x3")}>
-                Paint ×3
-              </button>
+              <button className={`btn sbtn ${bonusMode === "x2" ? "on" : ""}`} onClick={() => setBonusMode("x2")}>Paint ×2</button>
+              <button className={`btn sbtn ${bonusMode === "x3" ? "on" : ""}`} onClick={() => setBonusMode("x3")}>Paint ×3</button>
             </div>
             <p style={{ fontSize: 12, color: "var(--text2)", marginBottom: 8 }}>
               Click cells to set bonus type. Click again to clear.
@@ -881,21 +790,17 @@ function App() {
         </div>
       </div>
 
-      {/* JOINING (guest) */}
       <div id="pg-joining" className={`page ${page === "joining" ? "on" : ""}`}>
         <div style={{ maxWidth: 480, margin: "80px auto", textAlign: "center" }}>
           <h2 style={{ marginBottom: 8 }}>Joined!</h2>
           <p style={{ color: "var(--text2)", marginBottom: 20 }}>Waiting for the host to start the game.</p>
           <div className="notice" style={{ justifyContent: "center" }}>
             <span className="pulse" />
-            <span>
-              {room?.status === "playing" ? "The game has started!" : "Host is setting up the board..."}
-            </span>
+            <span>{room?.status === "playing" ? "Loading the board..." : "Host is setting up the board..."}</span>
           </div>
         </div>
       </div>
 
-      {/* GAME */}
       <div id="pg-game" className={`page ${page === "game" ? "on" : ""}`}>
         <div className="gl">
           <div className="sb">
@@ -971,24 +876,21 @@ function App() {
 
           <div className="ba">
             <div className="sbar" id="sbar">
-              <span
-                className="pulse"
-                id="sbar-pulse"
-                style={{ display: gameState && !gameState.moves[myIndex].done ? "inline-block" : "none" }}
-              />
+              <span className="pulse" id="sbar-pulse" style={{ display: gameState && !gameState.moves[myIndex]?.done ? "inline-block" : "none" }} />
               <span id="sbar-txt">
                 {gameState?.over
                   ? "Game Over!"
                   : !gameState
-                    ? "Loading board..."
-                    : !gameState.moves[myIndex].done
+                    ? "Syncing board…"
+                    : !gameState.moves[myIndex]?.done
                       ? pending.piece && pending.cell !== null
-                        ? "Click Lock In to submit your move."
-                        : "Select a piece and then a square."
-                      : "Waiting for opponent..."}
+                        ? "Ready! Click Lock In to submit."
+                        : "Pick a piece, then click a square."
+                      : "Move locked – waiting for opponent…"}
               </span>
               <span className="mla" style={{ fontSize: 12, color: "var(--text3)" }} id="rnd-lbl">
                 Round {gameState?.round ?? 1}
+                {room ? ` · ${room.code}` : ""}
               </span>
             </div>
 
@@ -1009,22 +911,42 @@ function App() {
                 <div className="lb" style={{ border: "2px solid var(--coral-400)" }} />
                 ×3 bonus
               </div>
+              {!gameState && session && (
+                <button
+                  className="btn sbtn mla"
+                  style={{ marginLeft: "auto", padding: "2px 8px", fontSize: "11px" }}
+                  onClick={() => {
+                    const ns = readJson<GameState>(stateKey(session.code));
+                    if (ns) setGameState(ns);
+                  }}
+                >
+                  Reload board
+                </button>
+              )}
             </div>
 
             {renderGameBoard()}
 
-            {!gameState || (!pending.piece && !pending.cell) ? null : (
-              <div className="mt12">
+            <div className="mt12 flex" style={{ gap: 8, flexWrap: "wrap" }}>
+              {!gameState ? (
+                <div style={{ fontSize: 12, color: "var(--text2)" }}>
+                  If the board stays empty, open this room in a second tab with the code <strong>{room?.code ?? session?.code}</strong>.
+                </div>
+              ) : !gameState.moves[myIndex]?.done && pending.piece && pending.cell !== null ? (
                 <button className="btn btnp" onClick={submitMove}>
-                  Lock In
+                  Lock In move
                 </button>
-              </div>
-            )}
+              ) : null}
+              {gameState && !gameState.moves[myIndex]?.done && pending.piece && pending.cell !== null && (
+                <button className="btn" onClick={() => setPending({ piece: null, cell: null })}>
+                  Clear
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>
 
-      {/* WINNER OVERLAY */}
       <div className={`wov ${gameState?.over ? "on" : ""}`}>
         <div className="wc">
           <h2>
