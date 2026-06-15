@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { readRoom, readState, watchRoom, watchState, writeRoom, writeState } from "./firebase";
 
 type Piece = "wizard" | "warrior" | "dragon" | "goblin";
 type Role = "host" | "guest";
@@ -29,6 +30,7 @@ type MoveState = {
   done: boolean;
   cell: number | null;
   piece: Piece | null;
+  passed?: boolean;
 };
 
 type GameLogEntry = {
@@ -92,13 +94,12 @@ const SESSION_KEY = `${STORAGE_PREFIX}:session`;
 
 const PIECE_ORDER: Piece[] = ["wizard", "warrior", "dragon", "goblin"];
 
-function roomKey(code: string) {
-  return `${STORAGE_PREFIX}:room:${code}`;
-}
-
-function stateKey(code: string) {
-  return `${STORAGE_PREFIX}:state:${code}`;
-}
+// Per-player team identity, independent of "who is host/guest".
+// Player 0 is always "Team Green" and Player 1 is always "Team Purple",
+// regardless of which device/role they are.
+const TEAM_NAME: [string, string] = ["Green", "Purple"];
+const TEAM_VAR: [string, string] = ["--p1b", "--p2b"];
+const TEAM_BG_VAR: [string, string] = ["--p1bg", "--p2bg"];
 
 function readJson<T>(key: string): T | null {
   try {
@@ -110,7 +111,7 @@ function readJson<T>(key: string): T | null {
   }
 }
 
-function writeJson(key: string, value: unknown) {
+function writeJsonLocal(key: string, value: unknown) {
   window.localStorage.setItem(key, JSON.stringify(value));
 }
 
@@ -247,22 +248,47 @@ function checkSequences(state: GameState) {
   }
 }
 
-function resolveTurn(state: GameState) {
+// A player has no possible move if they have zero of every piece AND
+// cannot afford to buy any piece with their current points.
+function hasNoPlayableMove(player: PlayerState): boolean {
+  const hasAnyPiece = PIECE_ORDER.some((piece) => player.pieces[piece] > 0);
+  if (hasAnyPiece) return false;
+  const canAffordAny = PIECE_ORDER.some((piece) => player.pts >= COST[piece]);
+  return !canAffordAny;
+}
+
+function boardIsFull(state: GameState): boolean {
+  const playable: number[] = [];
+  for (let i = 0; i < state.setup.size * state.setup.size; i += 1) {
+    if (!state.setup.excluded.includes(i)) playable.push(i);
+  }
+  return playable.length > 0 && playable.every((index) => state.board[String(index)] || state.locked[String(index)]);
+}
+
+function resolveTurn(state: GameState): GameState {
   const next = cloneGameState(state);
   const move0 = next.moves[0];
   const move1 = next.moves[1];
 
-  if (!move0.piece || move0.cell === null || !move1.piece || move1.cell === null) {
+  if (!move0.done || !move1.done) {
     return next;
   }
 
-  next.players[0].pieces[move0.piece] -= 1;
-  next.players[1].pieces[move1.piece] -= 1;
+  if (move0.piece && move0.cell !== null) {
+    next.players[0].pieces[move0.piece] -= 1;
+  }
+  if (move1.piece && move1.cell !== null) {
+    next.players[1].pieces[move1.piece] -= 1;
+  }
 
-  const k0 = String(move0.cell);
-  const k1 = String(move1.cell);
-
-  if (move0.cell === move1.cell) {
+  if (
+    move0.piece &&
+    move1.piece &&
+    move0.cell !== null &&
+    move1.cell !== null &&
+    move0.cell === move1.cell
+  ) {
+    const k0 = String(move0.cell);
     const winner = resolveVs(move0.piece, move1.piece);
     if (winner === 0) {
       next.board[k0] = { owner: 0, piece: move0.piece };
@@ -275,13 +301,15 @@ function resolveTurn(state: GameState) {
       next.board[k0] = null;
     }
   } else {
-    const turns: Array<{ move: MoveState; owner: 0 | 1; key: string }> = [
-      { move: move0, owner: 0, key: k0 },
-      { move: move1, owner: 1, key: k1 },
+    const turns: Array<{ move: MoveState; owner: 0 | 1 }> = [
+      { move: move0, owner: 0 },
+      { move: move1, owner: 1 },
     ];
 
-    turns.forEach(({ move, owner, key }) => {
-      if (next.locked[key] || !move.piece || move.cell === null) return;
+    turns.forEach(({ move, owner }) => {
+      if (!move.piece || move.cell === null) return;
+      const key = String(move.cell);
+      if (next.locked[key]) return;
       const existing = next.board[key];
       if (!existing) {
         next.board[key] = { owner, piece: move.piece };
@@ -307,21 +335,49 @@ function resolveTurn(state: GameState) {
   ];
   next.round += 1;
 
-  const playable = [] as number[];
-  for (let i = 0; i < next.setup.size * next.setup.size; i += 1) {
-    if (!next.setup.excluded.includes(i)) playable.push(i);
+  const p0Stuck = hasNoPlayableMove(next.players[0]);
+  const p1Stuck = hasNoPlayableMove(next.players[1]);
+  const full = boardIsFull(next);
+
+  let endReason: string | null = null;
+  if (full) {
+    endReason = "The board is full.";
+  } else if (p0Stuck && p1Stuck) {
+    endReason = "Neither player has any pieces left to play.";
+  } else if (p0Stuck) {
+    endReason = `${next.players[0].name} has no pieces left and cannot move.`;
+  } else if (p1Stuck) {
+    endReason = `${next.players[1].name} has no pieces left and cannot move.`;
   }
-  if (playable.every((index) => next.board[String(index)] || next.locked[String(index)])) {
+
+  if (endReason) {
     next.over = true;
   }
 
   next.log = [
     ...next.log,
     { msg: `Round ${next.round - 1} resolved.` },
-    next.over ? { msg: "The board is full." } : { msg: `Round ${next.round} begins.` },
+    endReason ? { msg: endReason } : { msg: `Round ${next.round} begins.` },
   ];
 
   return next;
+}
+
+// If, at the start of a round, a player has no piece they can place and no
+// points to buy one, auto-mark their move as "passed" so the other player
+// isn't stuck waiting forever for a move that can never come.
+function applyAutoPasses(state: GameState): GameState {
+  if (state.over) return state;
+  let changed = false;
+  const next = cloneGameState(state);
+  for (let i: 0 | 1 = 0; i < 2; i = (i + 1) as 0 | 1) {
+    if (!next.moves[i].done && hasNoPlayableMove(next.players[i])) {
+      next.moves[i] = { done: true, cell: null, piece: null, passed: true };
+      next.log = [...next.log, { msg: `${next.players[i].name} has no pieces left and passes.` }];
+      changed = true;
+    }
+  }
+  return changed ? next : state;
 }
 
 function roomPage(session: SessionState | null, room: Room | null): Page {
@@ -348,6 +404,7 @@ function App() {
     piece: null,
     cell: null,
   });
+  const [connError, setConnError] = useState("");
   const copyTimer = useRef<number | null>(null);
 
   const page = useMemo(() => roomPage(session, room), [session, room]);
@@ -355,14 +412,22 @@ function App() {
   const myIndex = session?.role === "guest" ? 1 : 0;
   const opIndex = myIndex === 0 ? 1 : 0;
 
-  const saveRoom = (nextRoom: Room) => {
-    writeJson(roomKey(nextRoom.code), nextRoom);
+  const saveRoom = async (nextRoom: Room) => {
     setRoom(nextRoom);
+    try {
+      await writeRoom(nextRoom.code, nextRoom);
+    } catch (e) {
+      setConnError("Couldn't reach the server. Check your connection and Firebase setup.");
+    }
   };
 
-  const saveGame = (code: string, nextState: GameState) => {
-    writeJson(stateKey(code), nextState);
+  const saveGame = async (code: string, nextState: GameState) => {
     setGameState(nextState);
+    try {
+      await writeState(code, nextState);
+    } catch (e) {
+      setConnError("Couldn't reach the server. Check your connection and Firebase setup.");
+    }
   };
 
   const refreshSession = (nextSession: SessionState | null) => {
@@ -374,70 +439,52 @@ function App() {
       setPending({ piece: null, cell: null });
       return;
     }
-    const nextRoom = readJson<Room>(roomKey(nextSession.code));
-    const nextState = readJson<GameState>(stateKey(nextSession.code));
-    setRoom(nextRoom);
-    setGameState(nextState);
+    setRoom(null);
+    setGameState(null);
     setPending({ piece: null, cell: null });
   };
 
-  // Aggressive localStorage sync - fixes board not appearing for guest/host
+  // Live sync with Firebase Realtime Database — works across devices/browsers.
   useEffect(() => {
     if (!session) return;
-    const pull = () => {
-      const nextRoom = readJson<Room>(roomKey(session.code));
-      const nextState = readJson<GameState>(stateKey(session.code));
-      if (nextRoom) setRoom(nextRoom);
-      if (nextState) setGameState((prev) => {
-        // avoid unnecessary re-renders, but always take fresh state if round changed or moves changed
-        if (!prev) return nextState;
-        return JSON.stringify(prev) !== JSON.stringify(nextState) ? nextState : prev;
-      });
-      if (!nextRoom && session) {
-        // room was deleted – bounce to lobby
+    setConnError("");
+
+    const unsubRoom = watchRoom<Room>(session.code, (nextRoom) => {
+      if (!nextRoom) {
+        // Room was deleted or never existed — bounce back to lobby.
         refreshSession(null);
+        return;
       }
-    };
+      setRoom(nextRoom);
+    });
 
-    // initial pull
-    pull();
-
-    const onStorage = (event: StorageEvent) => {
-      if (!event.key) return;
-      if (event.key === roomKey(session.code) || event.key === stateKey(session.code)) {
-        pull();
-      }
-    };
-
-    window.addEventListener("storage", onStorage);
-    const iv = window.setInterval(pull, 450); // same-tab + cross-tab reliable sync
-    const visHandler = () => { if (document.visibilityState === "visible") pull(); };
-    document.addEventListener("visibilitychange", visHandler);
+    const unsubState = watchState<GameState>(session.code, (nextState) => {
+      if (nextState) setGameState(nextState);
+    });
 
     return () => {
-      window.removeEventListener("storage", onStorage);
-      window.clearInterval(iv);
-      document.removeEventListener("visibilitychange", visHandler);
+      unsubRoom();
+      unsubState();
     };
   }, [session?.code]);
 
+  // Keep an old localStorage backup so a refresh on the same device/tab
+  // doesn't lose anything while waiting for the first Firebase snapshot.
   useEffect(() => {
-    if (!session) return;
-    const nextRoom = readJson<Room>(roomKey(session.code));
-    if (!nextRoom) {
-      refreshSession(null);
-      return;
-    }
-    const nextState = readJson<GameState>(stateKey(session.code));
-    setRoom(nextRoom);
-    if (nextState) setGameState(nextState);
-  }, [session?.code]);
+    if (room && session) writeJsonLocal(`${STORAGE_PREFIX}:room:${session.code}`, room);
+  }, [room, session]);
 
+  useEffect(() => {
+    if (gameState && session) writeJsonLocal(`${STORAGE_PREFIX}:state:${session.code}`, gameState);
+  }, [gameState, session]);
+
+  // Host resolves the turn once both players have locked in.
   useEffect(() => {
     if (!session || session.role !== "host" || !gameState || gameState.over) return;
     if (!gameState.moves[0].done || !gameState.moves[1].done) return;
     const resolved = resolveTurn(gameState);
-    saveGame(session.code, resolved);
+    const withAutoPass = applyAutoPasses(resolved);
+    saveGame(session.code, withAutoPass);
   }, [gameState, session]);
 
   useEffect(() => {
@@ -466,37 +513,55 @@ function App() {
 
   const createRoom = async () => {
     setError("");
+    setConnError("");
     const hostName = name.trim() || "Player 1";
     const code = makeCode();
     const nextRoom: Room = { code, host: hostName, guest: null, status: "waiting" };
-    saveRoom(nextRoom);
-    refreshSession({ code, role: "host", name: hostName });
-    setSetup(emptySetup());
-    setBuilderTab("size");
+    try {
+      await writeRoom(code, nextRoom);
+      refreshSession({ code, role: "host", name: hostName });
+      setSetup(emptySetup());
+      setBuilderTab("size");
+    } catch (e) {
+      setError("Couldn't create the room. Check your connection and Firebase setup.");
+    }
   };
 
   const joinRoom = async () => {
     setError("");
+    setConnError("");
     const code = joinCode.trim().toUpperCase();
     if (code.length !== 6) {
       setError("Enter a 6-character room code.");
       return;
     }
-    const nextRoom = readJson<Room>(roomKey(code));
-    if (!nextRoom || nextRoom.guest) {
-      setError("Room not found or already full.");
+
+    let nextRoom: Room | null = null;
+    try {
+      nextRoom = await readRoom<Room>(code);
+    } catch (e) {
+      setError("Couldn't reach the server. Check your connection and Firebase setup.");
+      return;
+    }
+
+    if (!nextRoom) {
+      setError("Room not found.");
+      return;
+    }
+    if (nextRoom.guest) {
+      setError("Room is already full.");
       return;
     }
 
     const guestName = name.trim() || "Player 2";
     const updatedRoom: Room = { ...nextRoom, guest: guestName };
-    saveRoom(updatedRoom);
-    refreshSession({ code, role: "guest", name: guestName });
-
-    const nextState = readJson<GameState>(stateKey(code));
-    if (nextState && updatedRoom.status === "playing") {
-      setGameState(nextState);
+    try {
+      await writeRoom(code, updatedRoom);
+    } catch (e) {
+      setError("Couldn't join the room. Check your connection and Firebase setup.");
+      return;
     }
+    refreshSession({ code, role: "guest", name: guestName });
   };
 
   const startGame = async () => {
@@ -507,8 +572,8 @@ function App() {
     }
     const nextRoom: Room = { ...room, status: "playing" };
     const nextState = createGameState(nextRoom, setup);
-    saveGame(room.code, nextState);
-    saveRoom(nextRoom);
+    await saveGame(room.code, nextState);
+    await saveRoom(nextRoom);
   };
 
   const setGridSize = (size: number) => {
@@ -557,7 +622,7 @@ function App() {
     next.moves[myIndex] = { done: true, cell: pending.cell, piece: pending.piece };
     next.log = [...next.log, { msg: `${session.name} locked in.` }];
     setPending({ piece: null, cell: null });
-    saveGame(session.code, next);
+    await saveGame(session.code, next);
   };
 
   const buyPiece = async (piece: Piece) => {
@@ -568,7 +633,7 @@ function App() {
     me.pts -= COST[piece];
     me.pieces[piece] += 1;
     next.log = [...next.log, { msg: `${session.name} bought ${piece}.` }];
-    saveGame(session.code, next);
+    await saveGame(session.code, next);
   };
 
   const renderBuilderGrid = (kind: "shape" | "bonus") => {
@@ -643,7 +708,7 @@ function App() {
                 }}
                 title={
                   isExcluded ? "Excluded" :
-                  sq ? `${gameState?.players[sq.owner]?.name ?? (sq.owner===0?"P1":"P2")} – ${sq.piece}` :
+                  sq ? `${gameState?.players[sq.owner]?.name ?? (sq.owner===0?"P1":"P2")} (Team ${TEAM_NAME[sq.owner]}) – ${sq.piece}` :
                   bonusType ? `Bonus ×${bonusType}` : "Empty"
                 }
               >
@@ -672,7 +737,7 @@ function App() {
         <div className="lw">
           <div className="lc">
             <h1>TrapGrid</h1>
-            <p className="sub">Simultaneous strategy — trap your opponent's pieces to claim the board. Open in two tabs to play locally.</p>
+            <p className="sub">Simultaneous strategy — trap your opponent's pieces to claim the board. Share a room code to play with someone on another device.</p>
             <div className="fld">
               <label htmlFor="inp-name">Your name</label>
               <input
@@ -705,6 +770,11 @@ function App() {
             <div id="lb-err" className="err" style={{ display: error ? "block" : "none" }}>
               {error}
             </div>
+            {connError && (
+              <div className="err" style={{ display: "block" }}>
+                {connError}
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -725,6 +795,12 @@ function App() {
             <span className="pulse" />
             <span>{room?.guest ? `${room.guest} joined!` : "Waiting for opponent to join..."}</span>
           </div>
+
+          {connError && (
+            <div className="err" style={{ display: "block", marginBottom: 16 }}>
+              {connError}
+            </div>
+          )}
 
           <h3 style={{ marginBottom: 12 }}>Board setup</h3>
 
@@ -798,6 +874,11 @@ function App() {
             <span className="pulse" />
             <span>{room?.status === "playing" ? "Loading the board..." : "Host is setting up the board..."}</span>
           </div>
+          {connError && (
+            <div className="err" style={{ display: "block", marginTop: 16 }}>
+              {connError}
+            </div>
+          )}
         </div>
       </div>
 
@@ -806,7 +887,7 @@ function App() {
           <div className="sb">
             <div className="pc me">
               <div className="plbl" id="my-lbl">
-                {gameState ? `You (${gameState.players[myIndex]?.name ?? "You"})` : "You"}
+                {gameState ? `You — Team ${TEAM_NAME[myIndex]} (${gameState.players[myIndex]?.name ?? "You"})` : `You — Team ${TEAM_NAME[myIndex]}`}
               </div>
               <div className="pbig" id="my-pts">
                 {gameState ? `${gameState.players[myIndex]?.pts ?? 0} ` : "0 "}<span>pts</span>
@@ -831,6 +912,11 @@ function App() {
                     })
                   : null}
               </div>
+              {gameState && gameState.moves[myIndex]?.passed && (
+                <div className="notice mt8" style={{ fontSize: 11 }}>
+                  No pieces left — this round was auto-passed for you.
+                </div>
+              )}
               <div style={{ fontSize: 11, color: "var(--text2)", marginTop: 7 }}>Buy pieces</div>
               <div className="buychips" id="my-buy">
                 {PIECE_ORDER.map((piece) => {
@@ -847,7 +933,7 @@ function App() {
 
             <div className="pc op">
               <div className="plbl" id="op-lbl">
-                {gameState ? gameState.players[opIndex]?.name ?? "Opponent" : "Opponent"}
+                {gameState ? `${gameState.players[opIndex]?.name ?? "Opponent"} — Team ${TEAM_NAME[opIndex]}` : `Opponent — Team ${TEAM_NAME[opIndex]}`}
               </div>
               <div className="pbig" id="op-pts">
                 {gameState ? `${gameState.players[opIndex]?.pts ?? 0} ` : "0 "}<span>pts</span>
@@ -865,6 +951,11 @@ function App() {
                     })
                   : null}
               </div>
+              {gameState?.over && hasNoPlayableMove(gameState.players[opIndex]) && (
+                <div className="notice mt8" style={{ fontSize: 11 }}>
+                  {gameState.players[opIndex].name} has no pieces left and points too low to buy more.
+                </div>
+              )}
             </div>
 
             <div className="log" id="glog">
@@ -886,7 +977,9 @@ function App() {
                       ? pending.piece && pending.cell !== null
                         ? "Ready! Click Lock In to submit."
                         : "Pick a piece, then click a square."
-                      : "Move locked – waiting for opponent…"}
+                      : !gameState.moves[opIndex]?.done
+                        ? `Move locked – waiting for ${gameState.players[opIndex]?.name ?? "opponent"}…`
+                        : "Resolving round…"}
               </span>
               <span className="mla" style={{ fontSize: 12, color: "var(--text3)" }} id="rnd-lbl">
                 Round {gameState?.round ?? 1}
@@ -897,11 +990,11 @@ function App() {
             <div className="lgd">
               <div className="li">
                 <div className="lb" style={{ background: "var(--p1bg)", border: "1px solid var(--p1b)" }} />
-                P1
+                Team Green {gameState ? `(${gameState.players[0].name})` : ""}
               </div>
               <div className="li">
                 <div className="lb" style={{ background: "var(--p2bg)", border: "1px solid var(--p2b)" }} />
-                P2
+                Team Purple {gameState ? `(${gameState.players[1].name})` : ""}
               </div>
               <div className="li">
                 <div className="lb" style={{ border: "2px solid var(--amber-400)" }} />
@@ -911,18 +1004,6 @@ function App() {
                 <div className="lb" style={{ border: "2px solid var(--coral-400)" }} />
                 ×3 bonus
               </div>
-              {!gameState && session && (
-                <button
-                  className="btn sbtn mla"
-                  style={{ marginLeft: "auto", padding: "2px 8px", fontSize: "11px" }}
-                  onClick={() => {
-                    const ns = readJson<GameState>(stateKey(session.code));
-                    if (ns) setGameState(ns);
-                  }}
-                >
-                  Reload board
-                </button>
-              )}
             </div>
 
             {renderGameBoard()}
@@ -930,7 +1011,7 @@ function App() {
             <div className="mt12 flex" style={{ gap: 8, flexWrap: "wrap" }}>
               {!gameState ? (
                 <div style={{ fontSize: 12, color: "var(--text2)" }}>
-                  If the board stays empty, open this room in a second tab with the code <strong>{room?.code ?? session?.code}</strong>.
+                  Syncing with the room <strong>{room?.code ?? session?.code}</strong>…
                 </div>
               ) : !gameState.moves[myIndex]?.done && pending.piece && pending.cell !== null ? (
                 <button className="btn btnp" onClick={submitMove}>
@@ -951,14 +1032,14 @@ function App() {
         <div className="wc">
           <h2>
             {gameState && gameState.players[0].pts > gameState.players[1].pts
-              ? `${gameState.players[0].name} wins!`
+              ? `${gameState.players[0].name} (Team Green) wins!`
               : gameState && gameState.players[1].pts > gameState.players[0].pts
-                ? `${gameState.players[1].name} wins!`
+                ? `${gameState.players[1].name} (Team Purple) wins!`
                 : "It's a tie!"}
           </h2>
           <p>
             {gameState
-              ? `${gameState.players[0].name}: ${gameState.players[0].pts} pts\n${gameState.players[1].name}: ${gameState.players[1].pts} pts`
+              ? `${gameState.players[0].name} (Green): ${gameState.players[0].pts} pts\n${gameState.players[1].name} (Purple): ${gameState.players[1].pts} pts`
               : ""}
           </p>
           <button className="btn btnp" onClick={() => window.location.reload()}>
