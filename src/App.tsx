@@ -407,6 +407,7 @@ function App() {
   const [connError, setConnError] = useState("");
   const copyTimer = useRef<number | null>(null);
   const gameStateRef = useRef<GameState | null>(null);
+  const resolvingRef = useRef(false);
 
   const page = useMemo(() => roomPage(session, room), [session, room]);
 
@@ -414,7 +415,6 @@ function App() {
   const opIndex = myIndex === 0 ? 1 : 0;
 
   const saveRoom = async (nextRoom: Room) => {
-    setRoom(nextRoom);
     try {
       await writeRoom(nextRoom.code, nextRoom);
     } catch (e) {
@@ -423,8 +423,6 @@ function App() {
   };
 
   const saveGame = async (code: string, nextState: GameState) => {
-    gameStateRef.current = nextState;
-    setGameState(nextState);
     try {
       await writeState(code, nextState);
     } catch (e) {
@@ -487,9 +485,13 @@ function App() {
   useEffect(() => {
     if (!session || session.role !== "host" || !gameState || gameState.over) return;
     if (!gameState.moves[0].done || !gameState.moves[1].done) return;
+    if (resolvingRef.current) return;
+    resolvingRef.current = true;
     const resolved = resolveTurn(gameState);
     const withAutoPass = applyAutoPasses(resolved);
-    saveGame(session.code, withAutoPass);
+    saveGame(session.code, withAutoPass).finally(() => {
+      resolvingRef.current = false;
+    });
   }, [gameState, session]);
 
   useEffect(() => {
@@ -623,7 +625,7 @@ function App() {
 
   const submitMove = async () => {
     if (!session || !pending.piece || pending.cell === null) return;
-    const latest = gameStateRef.current;
+    const latest = gameStateRef.current ?? gameState;
     if (!latest || latest.moves[myIndex].done) return;
     const next = cloneGameState(latest);
     next.moves[myIndex] = { done: true, cell: pending.cell, piece: pending.piece };
@@ -633,8 +635,10 @@ function App() {
   };
 
   const buyPiece = async (piece: Piece) => {
-    if (!session || !gameState) return;
-    const next = cloneGameState(gameState);
+    if (!session) return;
+    const latest = gameStateRef.current ?? gameState;
+    if (!latest) return;
+    const next = cloneGameState(latest);
     const me = next.players[myIndex];
     if (me.pts < COST[piece] || next.over) return;
     me.pts -= COST[piece];
