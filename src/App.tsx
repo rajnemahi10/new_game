@@ -406,6 +406,7 @@ function App() {
   });
   const [connError, setConnError] = useState("");
   const copyTimer = useRef<number | null>(null);
+  const gameStateRef = useRef<GameState | null>(null);
 
   const page = useMemo(() => roomPage(session, room), [session, room]);
 
@@ -422,6 +423,7 @@ function App() {
   };
 
   const saveGame = async (code: string, nextState: GameState) => {
+    gameStateRef.current = nextState;
     setGameState(nextState);
     try {
       await writeState(code, nextState);
@@ -459,7 +461,10 @@ function App() {
     });
 
     const unsubState = watchState<GameState>(session.code, (nextState) => {
-      if (nextState) setGameState(nextState);
+      if (nextState) {
+        gameStateRef.current = nextState;
+        setGameState(nextState);
+      }
     });
 
     return () => {
@@ -617,8 +622,10 @@ function App() {
   };
 
   const submitMove = async () => {
-    if (!session || !gameState || !pending.piece || pending.cell === null) return;
-    const next = cloneGameState(gameState);
+    if (!session || !pending.piece || pending.cell === null) return;
+    const latest = gameStateRef.current;
+    if (!latest || latest.moves[myIndex].done) return;
+    const next = cloneGameState(latest);
     next.moves[myIndex] = { done: true, cell: pending.cell, piece: pending.piece };
     next.log = [...next.log, { msg: `${session.name} locked in.` }];
     setPending({ piece: null, cell: null });
