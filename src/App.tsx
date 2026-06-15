@@ -380,6 +380,32 @@ function applyAutoPasses(state: GameState): GameState {
   return changed ? next : state;
 }
 
+function toFirebaseArray<T>(val: T[] | Record<string, T> | null | undefined): T[] {
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  return Object.values(val) as T[];
+}
+
+function normalizeGameState(raw: GameState): GameState {
+  return {
+    ...raw,
+    setup: {
+      ...raw.setup,
+      excluded: toFirebaseArray(raw.setup?.excluded),
+      bonus: raw.setup?.bonus ?? {},
+    },
+    usedBonus: toFirebaseArray(raw.usedBonus),
+    log: toFirebaseArray(raw.log),
+    players: toFirebaseArray(raw.players).map((p) => ({
+      ...p,
+      pieces: p.pieces ?? {},
+    })) as [PlayerState, PlayerState],
+    moves: toFirebaseArray(raw.moves) as [MoveState, MoveState],
+    board: raw.board ?? {},
+    locked: raw.locked ?? {},
+  };
+}
+
 function roomPage(session: SessionState | null, room: Room | null): Page {
   if (!session) return "lobby";
   if (room?.status === "playing") return "game";
@@ -406,8 +432,6 @@ function App() {
   });
   const [connError, setConnError] = useState("");
   const copyTimer = useRef<number | null>(null);
-  const gameStateRef = useRef<GameState | null>(null);
-  const resolvingRef = useRef(false);
 
   const page = useMemo(() => roomPage(session, room), [session, room]);
 
@@ -415,6 +439,7 @@ function App() {
   const opIndex = myIndex === 0 ? 1 : 0;
 
   const saveRoom = async (nextRoom: Room) => {
+    setRoom(nextRoom);
     try {
       await writeRoom(nextRoom.code, nextRoom);
     } catch (e) {
@@ -423,6 +448,7 @@ function App() {
   };
 
   const saveGame = async (code: string, nextState: GameState) => {
+    setGameState(nextState);
     try {
       await writeState(code, nextState);
     } catch (e) {
@@ -459,10 +485,7 @@ function App() {
     });
 
     const unsubState = watchState<GameState>(session.code, (nextState) => {
-      if (nextState) {
-        gameStateRef.current = nextState;
-        setGameState(nextState);
-      }
+      if (nextState) setGameState(normalizeGameState(nextState));
     });
 
     return () => {
@@ -485,13 +508,9 @@ function App() {
   useEffect(() => {
     if (!session || session.role !== "host" || !gameState || gameState.over) return;
     if (!gameState.moves[0].done || !gameState.moves[1].done) return;
-    if (resolvingRef.current) return;
-    resolvingRef.current = true;
     const resolved = resolveTurn(gameState);
     const withAutoPass = applyAutoPasses(resolved);
-    saveGame(session.code, withAutoPass).finally(() => {
-      resolvingRef.current = false;
-    });
+    saveGame(session.code, withAutoPass);
   }, [gameState, session]);
 
   useEffect(() => {
@@ -624,10 +643,8 @@ function App() {
   };
 
   const submitMove = async () => {
-    if (!session || !pending.piece || pending.cell === null) return;
-    const latest = gameStateRef.current ?? gameState;
-    if (!latest || latest.moves[myIndex].done) return;
-    const next = cloneGameState(latest);
+    if (!session || !gameState || !pending.piece || pending.cell === null) return;
+    const next = cloneGameState(gameState);
     next.moves[myIndex] = { done: true, cell: pending.cell, piece: pending.piece };
     next.log = [...next.log, { msg: `${session.name} locked in.` }];
     setPending({ piece: null, cell: null });
@@ -635,10 +652,8 @@ function App() {
   };
 
   const buyPiece = async (piece: Piece) => {
-    if (!session) return;
-    const latest = gameStateRef.current ?? gameState;
-    if (!latest) return;
-    const next = cloneGameState(latest);
+    if (!session || !gameState) return;
+    const next = cloneGameState(gameState);
     const me = next.players[myIndex];
     if (me.pts < COST[piece] || next.over) return;
     me.pts -= COST[piece];
