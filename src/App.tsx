@@ -6,6 +6,7 @@ type Role = "host" | "guest";
 type Page = "lobby" | "waiting" | "joining" | "game";
 type BuilderTab = "size" | "shape" | "bonus";
 type BonusValue = 2 | 3;
+type BonusMode = "random" | "none";
 
 type Room = {
   code: string;
@@ -91,6 +92,9 @@ const TRAPS: Record<Piece, Piece | undefined> = {
 
 const STORAGE_PREFIX = "trapgrid";
 const SESSION_KEY = `${STORAGE_PREFIX}:session`;
+const BOARD_SIZE = 8;
+const RANDOM_BONUS_PATTERN: BonusValue[] = [2, 2, 2, 3, 3];
+const BATTLE_WIN_POINTS = 1;
 
 const PIECE_ORDER: Piece[] = ["wizard", "warrior", "dragon", "goblin"];
 
@@ -100,6 +104,11 @@ const PIECE_ORDER: Piece[] = ["wizard", "warrior", "dragon", "goblin"];
 const TEAM_NAME: [string, string] = ["Green", "Purple"];
 const TEAM_VAR: [string, string] = ["--p1b", "--p2b"];
 const TEAM_BG_VAR: [string, string] = ["--p1bg", "--p2bg"];
+const TEAM_TEXT_VAR: [string, string] = ["--p1t", "--p2t"];
+
+function pieceName(piece: Piece) {
+  return piece.charAt(0).toUpperCase() + piece.slice(1);
+}
 
 function readJson<T>(key: string): T | null {
   try {
@@ -139,6 +148,35 @@ function makeCode() {
 
 function blankPieces() {
   return { wizard: 3, warrior: 3, dragon: 3, goblin: 1 };
+}
+
+function shuffle<T>(items: T[]) {
+  const next = [...items];
+  for (let index = next.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [next[index], next[swapIndex]] = [next[swapIndex], next[index]];
+  }
+  return next;
+}
+
+function randomizeBonuses(setup: BoardSetup): BoardSetup {
+  const availableCells: number[] = [];
+  for (let index = 0; index < setup.size * setup.size; index += 1) {
+    if (!setup.excluded.includes(index)) availableCells.push(index);
+  }
+
+  const bonus: Record<string, BonusValue> = {};
+  shuffle(availableCells)
+    .slice(0, Math.min(RANDOM_BONUS_PATTERN.length, availableCells.length))
+    .forEach((cell, index) => {
+      bonus[String(cell)] = RANDOM_BONUS_PATTERN[index];
+    });
+
+  return {
+    size: setup.size,
+    excluded: [...setup.excluded],
+    bonus,
+  };
 }
 
 function makeEmptyBoard(size: number) {
@@ -206,46 +244,111 @@ function resolveVs(a: Piece, b: Piece) {
   return -1;
 }
 
-function addPlacementScore(state: GameState, owner: 0 | 1, piece: Piece, cellIndex: number) {
-  const bonus = state.setup.bonus[String(cellIndex)];
-  const bonusIsFresh = bonus && !state.usedBonus.includes(cellIndex);
-  if (bonusIsFresh) {
-    state.usedBonus.push(cellIndex);
+function listSequenceLines(size: number) {
+  const lines: Array<[number, number, number]> = [];
+  for (let r = 0; r < size; r += 1) {
+    for (let c = 0; c < size - 2; c += 1) {
+      lines.push([r * size + c, r * size + c + 1, r * size + c + 2]);
+    }
   }
-  state.players[owner].pts += WORTH[piece] * (bonusIsFresh ? bonus : 1);
+  for (let c = 0; c < size; c += 1) {
+    for (let r = 0; r < size - 2; r += 1) {
+      lines.push([r * size + c, (r + 1) * size + c, (r + 2) * size + c]);
+    }
+  }
+  return lines;
+}
+
+function pieceCanMimic(piece: Piece, target: Exclude<Piece, "goblin">) {
+  return piece === "goblin" || piece === target;
+}
+
+function pieceSequenceValue(piece: Piece, pieceOwner: 0 | 1, scoringOwner: 0 | 1) {
+  if (piece === "goblin") return pieceOwner === scoringOwner ? WORTH.goblin : 0;
+  return WORTH[piece];
+}
+
+function scoreSequence(
+  state: GameState,
+  owner: 0 | 1,
+  cells: [number, number, number],
+  reservedBonuses: Set<number>,
+) {
+  const [a, mid, b] = cells;
+  const sa = state.board[String(a)];
+  const sm = state.board[String(mid)];
+  const sb = state.board[String(b)];
+
+  if (!sa || !sm || !sb) return null;
+  if (sa.owner !== owner || sb.owner !== owner || sm.owner === owner) return null;
+  if (state.locked[String(mid)]) return null;
+
+  const mainPieces: Array<Exclude<Piece, "goblin">> = ["wizard", "warrior", "dragon"];
+  const matchedEnd = mainPieces.find((piece) => {
+    const middleTarget = TRAPS[piece];
+    return (
+      middleTarget &&
+      pieceCanMimic(sa.piece, piece) &&
+      pieceCanMimic(sb.piece, piece) &&
+      pieceCanMimic(sm.piece, middleTarget)
+    );
+  });
+
+  if (!matchedEnd) return null;
+
+  const baseScore =
+    pieceSequenceValue(sa.piece, sa.owner, owner) +
+    pieceSequenceValue(sm.piece, sm.owner, owner) +
+    pieceSequenceValue(sb.piece, sb.owner, owner);
+
+  const availableBonuses = cells
+    .filter((cell) => !state.usedBonus.includes(cell) && !reservedBonuses.has(cell))
+    .map((cell) => state.setup.bonus[String(cell)])
+    .filter((bonus): bonus is BonusValue => !!bonus);
+  const multiplier = availableBonuses.length ? Math.max(...availableBonuses) : 1;
+
+  return { score: baseScore * multiplier, baseScore, multiplier, cells, middle: mid, endPiece: matchedEnd };
 }
 
 function checkSequences(state: GameState) {
   const n = state.setup.size;
-  for (let owner: 0 | 1 = 0; owner < 2; owner = (owner + 1) as 0 | 1) {
-    const lines: Array<[number, number, number]> = [];
-    for (let r = 0; r < n; r += 1) {
-      for (let c = 0; c < n - 2; c += 1) {
-        lines.push([r * n + c, r * n + c + 1, r * n + c + 2]);
-      }
-    }
-    for (let c = 0; c < n; c += 1) {
-      for (let r = 0; r < n - 2; r += 1) {
-        lines.push([r * n + c, (r + 1) * n + c, (r + 2) * n + c]);
-      }
-    }
+  const scoredMiddles = new Set<number>();
+  const newlyUsedBonus = new Set<number>();
+  const logs: GameLogEntry[] = [];
 
-    lines.forEach(([a, mid, b]) => {
-      const ka = String(a);
-      const km = String(mid);
-      const kb = String(b);
-      if (state.locked[km]) return;
-      const sa = state.board[ka];
-      const sm = state.board[km];
-      const sb = state.board[kb];
-      if (!sa || !sm || !sb) return;
-      if (sa.owner !== owner || sb.owner !== owner || sm.owner === owner) return;
-      if (sa.piece !== sb.piece) return;
-      if (TRAPS[sa.piece] !== sm.piece) return;
-      state.players[owner].pts += WORTH[sa.piece] * 2 + WORTH[sm.piece];
-      state.locked[km] = true;
+  for (let owner: 0 | 1 = 0; owner < 2; owner = (owner + 1) as 0 | 1) {
+    listSequenceLines(n).forEach((cells) => {
+      const scored = scoreSequence(state, owner, cells, newlyUsedBonus);
+      if (!scored || scoredMiddles.has(scored.middle)) return;
+
+      state.players[owner].pts += scored.score;
+      state.locked[String(scored.middle)] = true;
+      scoredMiddles.add(scored.middle);
+      logs.push({
+        msg:
+          scored.multiplier > 1
+            ? `${state.players[owner].name} completed a ${pieceName(scored.endPiece)} sequence for ${scored.baseScore} pts, boosted to ${scored.score} pts by ×${scored.multiplier}.`
+            : `${state.players[owner].name} completed a ${pieceName(scored.endPiece)} sequence for ${scored.score} pts.`,
+      });
+
+      scored.cells.forEach((cell) => {
+        const bonus = state.setup.bonus[String(cell)];
+        if (bonus && !state.usedBonus.includes(cell)) {
+          newlyUsedBonus.add(cell);
+        }
+      });
     });
   }
+
+  if (newlyUsedBonus.size) {
+    state.usedBonus = [...state.usedBonus, ...newlyUsedBonus];
+  }
+
+  return logs;
+}
+
+function awardBattleWinPoint(state: GameState, owner: 0 | 1) {
+  state.players[owner].pts += BATTLE_WIN_POINTS;
 }
 
 // A player has no possible move if they have zero of every piece AND
@@ -269,6 +372,7 @@ function resolveTurn(state: GameState): GameState {
   const next = cloneGameState(state);
   const move0 = next.moves[0];
   const move1 = next.moves[1];
+  const roundLogs: GameLogEntry[] = [];
 
   if (!move0.done || !move1.done) {
     return next;
@@ -292,13 +396,22 @@ function resolveTurn(state: GameState): GameState {
     const winner = resolveVs(move0.piece, move1.piece);
     if (winner === 0) {
       next.board[k0] = { owner: 0, piece: move0.piece };
-      addPlacementScore(next, 0, move0.piece, move0.cell);
+      awardBattleWinPoint(next, 0);
+      roundLogs.push({
+        msg: `${next.players[0].name}'s ${pieceName(move0.piece)} beat ${next.players[1].name}'s ${pieceName(move1.piece)} on the same square and gained 1 pt.`,
+      });
     } else if (winner === 1) {
       next.board[k0] = { owner: 1, piece: move1.piece };
-      addPlacementScore(next, 1, move1.piece, move1.cell);
+      awardBattleWinPoint(next, 1);
+      roundLogs.push({
+        msg: `${next.players[1].name}'s ${pieceName(move1.piece)} beat ${next.players[0].name}'s ${pieceName(move0.piece)} on the same square and gained 1 pt.`,
+      });
     } else {
       next.locked[k0] = true;
       next.board[k0] = null;
+      roundLogs.push({
+        msg: `${next.players[0].name} and ${next.players[1].name} chose the same square with matching strength. It became a dead square.`,
+      });
     }
   } else {
     const turns: Array<{ move: MoveState; owner: 0 | 1 }> = [
@@ -313,22 +426,27 @@ function resolveTurn(state: GameState): GameState {
       const existing = next.board[key];
       if (!existing) {
         next.board[key] = { owner, piece: move.piece };
-        addPlacementScore(next, owner, move.piece, move.cell);
         return;
       }
       if (existing.owner === owner) return;
       const winner = resolveVs(owner === 0 ? move.piece : existing.piece, owner === 0 ? existing.piece : move.piece);
       if (winner === owner) {
         next.board[key] = { owner, piece: move.piece };
-        addPlacementScore(next, owner, move.piece, move.cell);
+        awardBattleWinPoint(next, owner);
+        roundLogs.push({
+          msg: `${next.players[owner].name}'s ${pieceName(move.piece)} defeated ${next.players[existing.owner].name}'s ${pieceName(existing.piece)} and gained 1 pt.`,
+        });
       } else if (winner === -1) {
         next.locked[key] = true;
         next.board[key] = null;
+        roundLogs.push({
+          msg: `${next.players[owner].name}'s ${pieceName(move.piece)} and ${next.players[existing.owner].name}'s ${pieceName(existing.piece)} cancelled out and created a dead square.`,
+        });
       }
     });
   }
 
-  checkSequences(next);
+  const sequenceLogs = checkSequences(next);
   next.moves = [
     { done: false, cell: null, piece: null },
     { done: false, cell: null, piece: null },
@@ -357,6 +475,8 @@ function resolveTurn(state: GameState): GameState {
   next.log = [
     ...next.log,
     { msg: `Round ${next.round - 1} resolved.` },
+    ...roundLogs,
+    ...sequenceLogs,
     endReason ? { msg: endReason } : { msg: `Round ${next.round} begins.` },
   ];
 
@@ -413,7 +533,7 @@ function roomPage(session: SessionState | null, room: Room | null): Page {
 }
 
 function emptySetup(): BoardSetup {
-  return { size: 6, excluded: [], bonus: {} };
+  return { size: BOARD_SIZE, excluded: [], bonus: {} };
 }
 
 function App() {
@@ -424,8 +544,8 @@ function App() {
   const [room, setRoom] = useState<Room | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [setup, setSetup] = useState<BoardSetup>(emptySetup);
-  const [builderTab, setBuilderTab] = useState<BuilderTab>("size");
-  const [bonusMode, setBonusMode] = useState<"normal" | "x2" | "x3">("normal");
+  const [builderTab, setBuilderTab] = useState<BuilderTab>("shape");
+  const [bonusMode, setBonusMode] = useState<BonusMode>("random");
   const [pending, setPending] = useState<{ piece: Piece | null; cell: number | null }>({
     piece: null,
     cell: null,
@@ -547,7 +667,8 @@ function App() {
       await writeRoom(code, nextRoom);
       refreshSession({ code, role: "host", name: hostName });
       setSetup(emptySetup());
-      setBuilderTab("size");
+      setBuilderTab("shape");
+      setBonusMode("random");
     } catch (e) {
       setError("Couldn't create the room. Check your connection and Firebase setup.");
     }
@@ -597,14 +718,14 @@ function App() {
       return;
     }
     const nextRoom: Room = { ...room, status: "playing" };
-    const nextState = createGameState(nextRoom, setup);
+    const nextSetup = bonusMode === "random" ? randomizeBonuses(setup) : { ...setup, bonus: {} };
+    const nextState = createGameState(nextRoom, nextSetup);
     await saveGame(room.code, nextState);
     await saveRoom(nextRoom);
   };
 
   const setGridSize = (size: number) => {
     setSetup({ size, excluded: [], bonus: {} });
-    setBonusMode("normal");
   };
 
   const toggleShapeCell = (index: number) => {
@@ -616,20 +737,20 @@ function App() {
     });
   };
 
-  const toggleBonusCell = (index: number) => {
-    setSetup((current) => {
-      const bonus = { ...current.bonus };
-      if (bonusMode === "normal") {
-        delete bonus[String(index)];
-      } else if (bonusMode === "x2") {
-        if (bonus[String(index)] === 2) delete bonus[String(index)];
-        else bonus[String(index)] = 2;
-      } else if (bonusMode === "x3") {
-        if (bonus[String(index)] === 3) delete bonus[String(index)];
-        else bonus[String(index)] = 3;
-      }
-      return { ...current, bonus };
-    });
+  const restartGame = async () => {
+    if (!session || !room || !gameState || session.role !== "host") return;
+    const nextRoom: Room = { ...room, status: "playing" };
+    const baseSetup = {
+      size: gameState.setup.size,
+      excluded: [...gameState.setup.excluded],
+      bonus: {},
+    };
+    const nextSetup = bonusMode === "random" ? randomizeBonuses(baseSetup) : baseSetup;
+    const nextState = createGameState(nextRoom, nextSetup);
+    nextState.log = [{ msg: "Game restarted!" }];
+    setPending({ piece: null, cell: null });
+    await saveGame(room.code, nextState);
+    await saveRoom(nextRoom);
   };
 
   const selectPiece = (piece: Piece) => {
@@ -682,7 +803,7 @@ function App() {
             <div
               key={`${kind}-${index}`}
               className={className}
-              onClick={() => (kind === "shape" ? toggleShapeCell(index) : toggleBonusCell(index))}
+              onClick={() => (kind === "shape" ? toggleShapeCell(index) : undefined)}
             >
               {kind === "bonus" && bonus ? `×${bonus}` : ""}
             </div>
@@ -703,7 +824,10 @@ function App() {
     const submitted = !!gameState?.moves[myIndex]?.done;
 
     return (
-      <div className="board-wrap">
+      <div
+        className="board-wrap"
+        style={{ ["--active-team" as never]: `var(${TEAM_VAR[myIndex]})` }}
+      >
         <div className={isLoading ? "gb loading-board" : "gb"} style={{ gridTemplateColumns: `repeat(${size}, 54px)` }}>
           {Array.from({ length: size * size }, (_, index) => {
             const key = String(index);
@@ -711,15 +835,17 @@ function App() {
             const sq = board[key] as BoardPiece | null | undefined;
             const isLocked = !!locked[key];
             const bonusType = bonus[key];
+            const bonusUsed = !!gameState?.usedBonus?.includes(index);
             const classes = ["gc"];
 
             if (isExcluded) classes.push("gx");
             else if (isLocked && !sq) classes.push("gd");
             else if (isLocked) classes.push("glk");
             else if (sq) classes.push(sq.owner === 0 ? "g1" : "g2");
-            if (bonusType && (!gameState?.usedBonus || !gameState.usedBonus.includes(index))) {
+            if (bonusType && !bonusUsed) {
               classes.push(bonusType === 2 ? "gbx2" : "gbx3");
             }
+            if (bonusType && bonusUsed) classes.push("gbu");
             if (!submitted && pending.cell === index) classes.push("gsel");
 
             return (
@@ -735,13 +861,13 @@ function App() {
                 title={
                   isExcluded ? "Excluded" :
                   sq ? `${gameState?.players[sq.owner]?.name ?? (sq.owner===0?"P1":"P2")} (Team ${TEAM_NAME[sq.owner]}) – ${sq.piece}` :
-                  bonusType ? `Bonus ×${bonusType}` : "Empty"
+                  bonusType ? `Bonus ×${bonusType}${bonusUsed ? " (used)" : ""}` : "Empty"
                 }
               >
                 {sq ? <div className="pi">{ICONS[sq.piece]}</div> : null}
                 {sq ? <div className="od" style={{ background: sq.owner === 0 ? "#1D9E75" : "#534AB7" }} /> : null}
-                {bonusType && (!gameState?.usedBonus || !gameState.usedBonus.includes(index)) ? (
-                  <div className={`bl ${bonusType === 2 ? "x2" : "x3"}`}>×{bonusType}</div>
+                {bonusType ? (
+                  <div className={`bl ${bonusType === 2 ? "x2" : "x3"} ${bonusUsed ? "used" : ""}`}>×{bonusType}</div>
                 ) : null}
                 {!isLoading && submitted && gameState?.moves[myIndex].cell === index ? <div className="pend" /> : null}
               </div>
@@ -844,18 +970,12 @@ function App() {
 
           <div id="bt-size" style={{ display: builderTab === "size" ? "block" : "none" }}>
             <div className="flex" style={{ gap: 6, marginBottom: 8 }}>
-              {[6, 7, 8].map((size) => (
-                <button
-                  key={size}
-                  className={`btn sbtn ${setup.size === size ? "on" : ""}`}
-                  onClick={() => setGridSize(size)}
-                >
-                  {size}×{size}
-                </button>
-              ))}
+              <button className="btn sbtn on" onClick={() => setGridSize(BOARD_SIZE)}>
+                {BOARD_SIZE}×{BOARD_SIZE}
+              </button>
             </div>
             <p style={{ fontSize: 12, color: "var(--text2)" }}>
-              Current: <span id="size-lbl">{setup.size}×{setup.size}</span>
+              The board size is fixed at <span id="size-lbl">{setup.size}×{setup.size}</span>.
             </p>
           </div>
 
@@ -867,18 +987,29 @@ function App() {
           <div id="bt-bonus" style={{ display: builderTab === "bonus" ? "block" : "none" }}>
             <div className="flex" style={{ gap: 6, marginBottom: 8 }}>
               <button
-                className={`btn sbtn ${bonusMode === "normal" ? "on" : ""}`}
-                onClick={() => setBonusMode("normal")}
+                className={`btn sbtn ${bonusMode === "random" ? "on" : ""}`}
+                onClick={() => setBonusMode("random")}
               >
-                Normal
+                Random bonuses
               </button>
-              <button className={`btn sbtn ${bonusMode === "x2" ? "on" : ""}`} onClick={() => setBonusMode("x2")}>Paint ×2</button>
-              <button className={`btn sbtn ${bonusMode === "x3" ? "on" : ""}`} onClick={() => setBonusMode("x3")}>Paint ×3</button>
+              <button
+                className={`btn sbtn ${bonusMode === "none" ? "on" : ""}`}
+                onClick={() => setBonusMode("none")}
+              >
+                No bonuses
+              </button>
             </div>
             <p style={{ fontSize: 12, color: "var(--text2)", marginBottom: 8 }}>
-              Click cells to set bonus type. Click again to clear.
+              {bonusMode === "random"
+                ? "Bonus squares are randomized automatically when the match starts or restarts."
+                : "This match will start with no ×2 or ×3 bonus squares."}
             </p>
-            {renderBuilderGrid("bonus")}
+            {bonusMode === "random" ? (
+              <div className="bonus-preview">
+                <span className="bonus-chip x2">3 random ×2 score squares</span>
+                <span className="bonus-chip x3">2 random ×3 score squares</span>
+              </div>
+            ) : null}
           </div>
 
           <div className="flex mt20">
@@ -911,7 +1042,7 @@ function App() {
       <div id="pg-game" className={`page ${page === "game" ? "on" : ""}`}>
         <div className="gl">
           <div className="sb">
-            <div className="pc me">
+            <div className="pc me" style={{ borderColor: `var(${TEAM_VAR[myIndex]})` }}>
               <div className="plbl" id="my-lbl">
                 {gameState ? `You — Team ${TEAM_NAME[myIndex]} (${gameState.players[myIndex]?.name ?? "You"})` : `You — Team ${TEAM_NAME[myIndex]}`}
               </div>
@@ -930,6 +1061,11 @@ function App() {
                         <div
                           key={piece}
                           className={`chip ${selected ? "sel" : ""} ${disabled ? "dim" : ""}`}
+                          style={selected ? {
+                            borderColor: `var(${TEAM_VAR[myIndex]})`,
+                            background: `var(${TEAM_BG_VAR[myIndex]})`,
+                            color: `var(${TEAM_TEXT_VAR[myIndex]})`,
+                          } : undefined}
                           onClick={() => selectPiece(piece)}
                         >
                           {ICONS[piece]} {count}
@@ -957,7 +1093,7 @@ function App() {
               </div>
             </div>
 
-            <div className="pc op">
+            <div className="pc op" style={{ borderColor: `var(${TEAM_VAR[opIndex]})` }}>
               <div className="plbl" id="op-lbl">
                 {gameState ? `${gameState.players[opIndex]?.name ?? "Opponent"} — Team ${TEAM_NAME[opIndex]}` : `Opponent — Team ${TEAM_NAME[opIndex]}`}
               </div>
@@ -1024,11 +1160,32 @@ function App() {
               </div>
               <div className="li">
                 <div className="lb" style={{ border: "2px solid var(--amber-400)" }} />
-                ×2 bonus
+                ×2 score bonus
               </div>
               <div className="li">
                 <div className="lb" style={{ border: "2px solid var(--coral-400)" }} />
-                ×3 bonus
+                ×3 score bonus
+              </div>
+              <div className="li">
+                <div className="lb tentative" />
+                Tentative move
+              </div>
+            </div>
+
+            <div className="rulebox">
+              <div className="rulecol">
+                <h3>Battle Key</h3>
+                <p>{ICONS.wizard} Wizard defeats {ICONS.dragon} Dragon</p>
+                <p>{ICONS.dragon} Dragon defeats {ICONS.warrior} Warrior</p>
+                <p>{ICONS.warrior} Warrior defeats {ICONS.wizard} Wizard</p>
+                <p>{ICONS.goblin} Goblin mimics any piece but loses direct clashes.</p>
+              </div>
+              <div className="rulecol">
+                <h3>Sequence Layout</h3>
+                <p>{ICONS.warrior} Your strong piece</p>
+                <p>{ICONS.wizard} Opponent weaker piece</p>
+                <p>{ICONS.warrior} Your strong piece</p>
+                <p className="rulehint">Horizontal and vertical only. Intersections are allowed.</p>
               </div>
             </div>
 
@@ -1068,9 +1225,13 @@ function App() {
               ? `${gameState.players[0].name} (Green): ${gameState.players[0].pts} pts\n${gameState.players[1].name} (Purple): ${gameState.players[1].pts} pts`
               : ""}
           </p>
-          <button className="btn btnp" onClick={() => window.location.reload()}>
-            Play again
-          </button>
+          {session?.role === "host" ? (
+            <button className="btn btnp" onClick={restartGame}>
+              Restart game
+            </button>
+          ) : (
+            <p className="restart-note">Waiting for the host to restart the match.</p>
+          )}
         </div>
       </div>
     </>

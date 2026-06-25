@@ -495,7 +495,7 @@ select:focus {
 }
 
 .gc:hover:not(.gx):not(.gd):not(.glk) {
-  border-color: var(--teal-400) !important;
+  border-color: var(--active-team, var(--teal-400)) !important;
   background: var(--bg2) !important;
   transform: translateY(-1px);
 }
@@ -528,9 +528,9 @@ select:focus {
 }
 
 .gc.gsel {
-  outline: 2.5px solid var(--teal-400);
+  outline: 2.5px solid var(--active-team, var(--teal-400));
   outline-offset: 1px;
-  border-color: var(--teal-400) !important;
+  border-color: var(--active-team, var(--teal-400)) !important;
 }
 
 .gc.gbx2 {
@@ -571,6 +571,14 @@ select:focus {
   color: var(--coral-600);
 }
 
+.bl.used {
+  opacity: 0.42;
+}
+
+.gc.gbu {
+  box-shadow: inset 0 0 0 1px var(--border2);
+}
+
 .gc .pend {
   position: absolute;
   top: 3px;
@@ -578,7 +586,7 @@ select:focus {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--teal-400);
+  background: var(--active-team, var(--teal-400));
 }
 
 .gc.flash {
@@ -635,6 +643,40 @@ select:focus {
   border-radius: 2px;
 }
 
+.lb.tentative {
+  border-radius: 999px;
+  background: var(--teal-400);
+}
+
+.rulebox {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  background: var(--bg2);
+  border: 0.5px solid var(--border);
+  border-radius: var(--r);
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
+.rulecol h3 {
+  margin-bottom: 6px;
+}
+
+.rulecol p {
+  font-size: 12px;
+  color: var(--text2);
+  margin-bottom: 4px;
+}
+
+.rulecol p:last-child {
+  margin-bottom: 0;
+}
+
+.rulehint {
+  color: var(--text3);
+}
+
 .log {
   background: var(--bg2);
   border: 0.5px solid var(--border);
@@ -687,6 +729,39 @@ select:focus {
   font-size: 14px;
   margin-bottom: 20px;
   white-space: pre-line;
+}
+
+.restart-note {
+  margin-bottom: 0 !important;
+}
+
+.bonus-preview {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bonus-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--border2);
+}
+
+.bonus-chip.x2 {
+  background: var(--amber-50);
+  border-color: var(--amber-400);
+  color: var(--amber-600);
+}
+
+.bonus-chip.x3 {
+  background: var(--coral-50);
+  border-color: var(--coral-400);
+  color: var(--coral-600);
 }
 
 .mt8 {
@@ -791,5 +866,9 @@ select:focus {
   .bgrid {
     gap: 2px;
     padding: 8px;
+  }
+
+  .rulebox {
+    grid-template-columns: 1fr;
   }
 }
